@@ -1,4 +1,10 @@
-"""MyHelper — a personal-helper agent persona.
+"""[中文] MyHelper —— 个人生活/工作助手角色。
+
+与 Cowork 共享工作区工具集，但拥有独特的个性与系统提示词：具有长期记忆的个人助手，可在 App 内以及即时通讯应用中触达。
+作为可解析的角色保留（已持久化的会话可能引用它）。
+`name=` 参数允许用户为其自定义重命名。
+
+[English] MyHelper — a personal-helper agent persona.
 
 Shares Cowork's workspace toolset but has its own personality + prompt: a personal assistant
 with long-term memory, reachable in the app and over messaging. Retained as a resolvable persona
@@ -15,6 +21,7 @@ DEFAULT_HELPER_NAME = "MyHelper"
 
 
 def myhelper_instructions(name: str = DEFAULT_HELPER_NAME) -> str:
+    """[中文] 生成 MyHelper 的系统提示词。 / [English] Generate system prompt for MyHelper."""
     return (
         f"You are {name}, the user's always-on personal helper. You persist across time on a "
         "single continuous thread, remember what matters, and are reachable both in the app and "
@@ -28,13 +35,15 @@ def myhelper_instructions(name: str = DEFAULT_HELPER_NAME) -> str:
 
 
 def myhelper_agent(name: str = DEFAULT_HELPER_NAME) -> Agent:
+    """[中文] 构建 MyHelper 智能体实例。 / [English] Build the MyHelper agent instance."""
     return Agent(
         name="myhelper",
         title=name,
         system_prompt=myhelper_instructions(name),
         tool_factory=cowork_tool_factory,
         scheduling=True,
-        # The reply path for inbound Telegram/Slack sessions: chat tools come through
+        # [中文] Telegram/Slack 入站会话的回复路径：聊天工具现通过连接器门禁管理（规范 §11），因此在此声明所支持的平台。
+        # [English] The reply path for inbound Telegram/Slack sessions: chat tools come through
         # the connector gate now (spec §11), so the platforms are declared here.
         connectors=("slack", "telegram"),
     )

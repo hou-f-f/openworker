@@ -1,4 +1,5 @@
-"""Bounded, secret-free runtime discovery. No subprocesses or config-file reads."""
+"""[中文] 有边界且不含机密信息的运行时发现。无子进程且不读取配置文件。
+[English] Bounded, secret-free runtime discovery. No subprocesses or config-file reads."""
 from __future__ import annotations
 
 import shutil
@@ -34,7 +35,12 @@ def capture(workspace, roots) -> dict:
 
 def runtime_context_tool(permissions):
     def runtime_context() -> dict:
-        """Discover this session's working folders, tool availability and project
+        """[中文] 发现当前会话的工作文件夹、工具可用性及项目环境存在情况，
+        无需读取 .env、凭据、shell 配置文件或用户主目录缓存。在进行环境/工具检查前使用此工具。
+        事实不等于访问权限授予。对于测试，请使用项目配置的运行器；不要输出配置或凭据。
+        数据库端点和凭据故意不予返回。
+
+        [English] Discover this session's working folders, tool availability and project
         environment presence without reading .env, credentials, shell profiles or home
         caches. Use this before environment/tooling checks. Facts are not access grants.
         For tests, use the project's configured runner; do not print configuration or

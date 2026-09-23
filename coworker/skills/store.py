@@ -1,4 +1,16 @@
-"""Skill management — CRUD over skill folders + per-session mutes (SKILLS-SPEC §4).
+"""[中文] Skill（技能）管理 —— 技能文件夹的增删改查与会话级静音 (SKILLS-SPEC §4)。
+
+作用域 = 文件夹位置（以文件夹为事实来源）：全局技能存放在 ``state_dir()/skills``，
+项目技能存放在 ``<workspace>/.coworker/skills``。没有数据库；每个操作都是文件夹 + ``SKILL.md`` 操作，
+这使得项目技能可以通过 Git 免费共享。
+
+禁用状态特意不作为标记存放在技能文件夹内：项目文件夹随代码仓库分发，一个用户的禁用绝不能提交给队友。
+因此它保存在个人专用的 ``state_dir()/skills-settings.json`` 中。
+
+上传操作是分阶段暂存的（解析 → 预览 → 确认），以便用户在任何内容落入作用域目录之前，始终准确审查将要保存的内容。
+暂存内容保存在 ``state_dir()/skills-staged/<token>``，直到确认或放弃。
+
+[English] Skill management — CRUD over skill folders + per-session mutes (SKILLS-SPEC §4).
 
 Scope = folder location (folder-is-truth): global skills live in ``state_dir()/skills``,
 project skills in ``<workspace>/.coworker/skills``. There is no database; every operation
@@ -37,7 +49,8 @@ PROJECT_SCOPE = "project"
 
 
 def validate_name(name: str) -> str:
-    """Skill names become folder names — reject anything that could escape the scope dir."""
+    """[中文] 技能名称将成为文件夹名称 —— 拒绝任何可能逃逸出作用域目录的字符。
+    [English] Skill names become folder names — reject anything that could escape the scope dir."""
     name = (name or "").strip()
     if not name:
         raise ValueError("Skill name is required.")
@@ -51,7 +64,8 @@ def validate_name(name: str) -> str:
 
 
 def _frontmatter_source(md: Path) -> str:
-    """Read the optional ``source:`` frontmatter key (``uploaded`` etc.). Absent → created here."""
+    """[中文] 读取可选的 ``source:`` 键（``uploaded`` 等）。若无则表示在此处创建。
+    [English] Read the optional ``source:`` frontmatter key (``uploaded`` etc.). Absent → created here."""
     try:
         text = md.read_text(encoding="utf-8")
     except OSError:
@@ -81,7 +95,8 @@ def _write_skill_md(
 
 
 class SkillStore:
-    """Folder-backed skill CRUD across the global + project scopes."""
+    """[中文] 基于文件夹的跨全局与项目作用域的技能增删改查存储器。
+    [English] Folder-backed skill CRUD across the global + project scopes."""
 
     def __init__(self, global_dir: Optional[str | Path] = None) -> None:
         self.global_dir = Path(global_dir) if global_dir else state_dir() / "skills"
@@ -106,7 +121,8 @@ class SkillStore:
         raise ValueError(f"Unknown scope: {scope}")
 
     def _folder_of(self, base: Path, name: str) -> Path:
-        """The skill's folder, guarded against escaping its scope dir (symlinked folders
+        """[中文] 获取技能文件夹，防止逃逸其作用域目录（解析到其他位置的符号链接将被视为不存在）。
+        [English] The skill's folder, guarded against escaping its scope dir (symlinked folders
         that resolve elsewhere are treated as absent rather than followed)."""
         folder = base / name
         try:
@@ -122,7 +138,8 @@ class SkillStore:
     def find(
         self, name: str, workspace: Optional[str | Path] = None
     ) -> tuple[Path, str]:
-        """Locate a skill by name, most-local first (project before global) — mirrors the
+        """[中文] 按名称查找技能，优先查找最本地的（项目优先于全局）—— 镜像加载器的冲突优先级。
+        [English] Locate a skill by name, most-local first (project before global) — mirrors the
         loader's collision precedence so management operates on the copy the model sees."""
         name = validate_name(name)
         if workspace:
@@ -278,7 +295,8 @@ class SkillStore:
 
     # -- uploads: stage → preview → confirm -----------------------------------------
     def stage_upload(self, data: bytes, filename: str = "") -> dict[str, Any]:
-        """Stage an upload and return the parsed preview. Accepts a ``.zip`` (folder skill)
+        """[中文] 暂存上传并返回解析后的预览。接受 ``.zip``（文件夹技能）或带有 YAML frontmatter 的纯 ``SKILL.md``。在调用 :meth:`confirm_upload` 之前不会真正安装到系统。
+        [English] Stage an upload and return the parsed preview. Accepts a ``.zip`` (folder skill)
         or a bare ``SKILL.md`` with YAML frontmatter. Nothing is installed until
         :meth:`confirm_upload`. (A ``.skill`` file is a renamed zip and still unpacks —
         just not advertised.)"""
@@ -338,7 +356,8 @@ class SkillStore:
         }
 
     def _stage_single_md(self, data: bytes, filename: str) -> dict[str, Any]:
-        """The bare-.md path: one SKILL.md, no resources. Frontmatter must carry the name
+        """[中文] 单一 `.md` 文件暂存路径：仅有一个 SKILL.md，无附加资源。Frontmatter 必须包含名称。
+        [English] The bare-.md path: one SKILL.md, no resources. Frontmatter must carry the name
         (there is no folder to fall back to)."""
         if filename.lower().endswith((".zip", ".skill")):
             raise ValueError("Not a valid .zip archive.")
@@ -376,6 +395,8 @@ class SkillStore:
         scope: str = GLOBAL_SCOPE,
         workspace: Optional[str | Path] = None,
     ) -> dict[str, Any]:
+        """[中文] 确认暂存的技能上传并移动至目标作用域目录。
+        [English] Confirm staged skill upload and move to target scope directory."""
         staged = self._staging_dir / str(token)
         if not (staged / "SKILL.md").is_file():
             raise ValueError("Unknown or expired upload.")
@@ -387,7 +408,8 @@ class SkillStore:
             raise ValueError(f"A skill named '{name}' already exists in that scope.")
         base.mkdir(parents=True, exist_ok=True)
         shutil.move(str(staged), str(folder))
-        # Stamp provenance so the Settings screen can distinguish uploaded from local.
+        # [中文] 标记出处，以便“设置”界面可以区分上传的技能和本地创建的技能。
+        # [English] Stamp provenance so the Settings screen can distinguish uploaded from local.
         if not _frontmatter_source(folder / "SKILL.md"):
             _write_skill_md(
                 folder,
@@ -399,12 +421,14 @@ class SkillStore:
         return {"name": name, "scope": scope, "path": str(folder)}
 
     def discard_upload(self, token: str) -> None:
+        """[中文] 放弃并清理暂存上传。 / [English] Discard and clean up staged upload."""
         staged = self._staging_dir / str(token)
         shutil.rmtree(staged, ignore_errors=True)
 
 
 class SessionSkillStore:
-    """``{session_id: {skill: bool}}`` — per-session mutes only; an absent entry means the
+    """[中文] 会话级技能禁用覆盖存储器（``{session_id: {skill: bool}}``）—— 仅记录会话级静音；缺失的条目表示继承全局/项目设置。
+    [English] ``{session_id: {skill: bool}}`` — per-session mutes only; an absent entry means the
     session inherits (enabled unless disabled in Settings). Mirrors SessionConnectionStore."""
 
     def __init__(self, path: Optional[str | Path] = None) -> None:
@@ -462,7 +486,9 @@ def effective_skills(
     disabled: set[str],
     session_overrides: dict[str, bool],
 ) -> set[str]:
-    """The single source of truth for a session's skill menu (SKILLS-SPEC §3): any-off-wins.
+    """[中文] 会话有效技能菜单的唯一真实来源 (SKILLS-SPEC §3)：任何一处禁用即生效 (any-off-wins)。
+    设置中的禁用会在全局范围内移除该技能 —— 会话覆盖无法强行复活它。在无任何意见时，技能默认开启。
+    [English] The single source of truth for a session's skill menu (SKILLS-SPEC §3): any-off-wins.
     A Settings disable removes the skill everywhere — a session override can NOT resurrect
     it. Absent any opinion, a skill is on."""
     out: set[str] = set()
@@ -526,7 +552,9 @@ def save_skill_tool(
     *,
     allowed_dirs: Optional[list[str | Path]] = None,
 ) -> Callable:
-    """Build the `save_skill` tool (SKILLS-SPEC §5.2). `requires_approval=True` routes every
+    """[中文] 构建 `save_skill` 工具 (SKILLS-SPEC §5.2)。`requires_approval=True` 将每个调用通过标准审批卡片进行路由 ——
+    工具的参数即为审查界面，这就是为什么架构模式中携带完整指令正文与文件列表的原因。打包的文件只能从 `allowed_dirs` 读取：工作者绝不能将机器上的任意路径打包进技能。
+    [English] Build the `save_skill` tool (SKILLS-SPEC §5.2). `requires_approval=True` routes every
     call through the standard approval card — the tool's ARGUMENTS are the review surface,
     which is why the schema carries the full instructions and file list. Bundled files may
     only be read from `allowed_dirs` (the session's roots): the worker must never bundle
@@ -554,7 +582,8 @@ def save_skill_tool(
         if not (instructions or "").strip():
             return {"error": "Skill instructions are required."}
 
-        # Resolve + vet the bundle BEFORE touching disk, so a bad file never leaves a
+        # [中文] 在操作磁盘前解析并审查整个捆绑包，因此损坏的文件绝不会留下半写的技能。
+        # [English] Resolve + vet the bundle BEFORE touching disk, so a bad file never leaves a
         # half-written skill behind.
         staged: list[tuple[Path, str]] = []
         for raw in files or []:
@@ -581,7 +610,8 @@ def save_skill_tool(
                 return {"error": f"Duplicate bundled filename: {base}"}
             staged.append((rp, base))
 
-        # Worker-authored skills always land GLOBAL (§3.4: never a throwaway location).
+        # [中文] 工作者编写的技能始终保存在全局作用域 (§3.4: 绝非临时丢弃的位置)。
+        # [English] Worker-authored skills always land GLOBAL (§3.4: never a throwaway location).
         try:
             folder, _scope = store.find(name)
             action = "updated"
