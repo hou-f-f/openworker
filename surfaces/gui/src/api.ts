@@ -13,7 +13,8 @@ import type { GroupedQuestion, QuestionOption, SessionInfo, WsEvent } from "./ty
 
 declare const __COWORKER_DEV_TOKEN__: string;
 
-// Endpoint resolution order: runtime-injected globals (Tauri sets `window.__COWORKER_HTTP__`
+// [中文] 端点解析顺序：运行时注入的全局变量（Tauri 为其动态选择的 sidecar 端口设置 `window.__COWORKER_HTTP__`）→ Vite 环境变量 → 当页面本身通过 https 提供服务时的同源（托管仪表板：服务同时提供 SPA 和 API）→ 127.0.0.1:8765 开发默认值。这保持了单一代码库：浏览器 `npm run dev` 访问 8765；桌面外壳访问其 sidecar；machines.openworker.com 与自身对话。
+// [English] Endpoint resolution order: runtime-injected globals (Tauri sets `window.__COWORKER_HTTP__`
 // for its dynamically-chosen sidecar port) → Vite env → same-origin when the page itself is
 // served over https (the hosted dashboard: the service serves both SPA and API) → the
 // 127.0.0.1:8765 dev default. This keeps a single codebase: browser `npm run dev` hits 8765;
@@ -33,7 +34,8 @@ const apiToken = (): string =>
   (import.meta as any).env?.VITE_COWORKER_API_TOKEN ||
   (typeof __COWORKER_DEV_TOKEN__ === "string" ? __COWORKER_DEV_TOKEN__ : "");
 
-// The org this browser acts in (hosted multi-tenant only; empty elsewhere). Set at cloud
+// [中文] 当前浏览器操作的组织（仅限托管多租户；其他地方为空）。在云端启动时从 /v1/me 设置，也可由组织切换器设置；附带在每个请求中，以便后端的解析器无需对每个端点进行管道改造。HTTP 将其作为标头携带；浏览器 WebSocket 无法设置标头，因此在那里它是一个查询参数（组织 ID 是租户标签，不是秘密）。
+// [English] The org this browser acts in (hosted multi-tenant only; empty elsewhere). Set at cloud
 // boot from /v1/me and by the org switcher; rides every request so the backend's resolver
 // needs no per-endpoint plumbing. HTTP carries it as a header; a browser WebSocket cannot
 // set headers, so there it is a query parameter (org ids are tenant labels, not secrets).
@@ -45,12 +47,16 @@ export function getActiveOrg(): string {
   return activeOrg;
 }
 
-// All local REST calls pass through this module, so a module-local wrapper applies launch
+// [中文] 所有本地 REST 调用都通过此模块，因此模块本地包装器应用启动身份验证，而无需每个端点辅助函数都记住安全标头。
+// [English] All local REST calls pass through this module, so a module-local wrapper applies launch
 // authentication without asking every endpoint helper to remember the security header.
-/** Fired (once per burst) when OUR OWN backend answers 401: the launch token this
+/**
+ * [中文] 当我们自己的后端返回 401 时触发（每次突发一次）：此窗口携带的启动令牌不再与运行中的服务匹配 —— sidecar 在烘焙了旧令牌的开发 GUI 下重启，或者是过期的标签页。App 呈现纯净的注销状态，而不是因错误正文崩溃。
+ * [English] Fired (once per burst) when OUR OWN backend answers 401: the launch token this
  * window carries no longer matches the running service — a sidecar restarted under a
  * dev GUI that baked the old token, or a stale tab. The App renders a plain signed-out
- * state instead of crashing on the error body (ledger 2026-09-01: `undefined.includes`). */
+ * state instead of crashing on the error body (ledger 2026-09-01: `undefined.includes`).
+ */
 export const API_UNAUTHORIZED = "openworker:api-unauthorized";
 let unauthorizedAnnounced = 0;
 const announceUnauthorized = () => {
@@ -69,7 +75,8 @@ const fetch = (
   if (token) headers.set("X-OpenWorker-Token", token);
   if (activeOrg) headers.set("X-OCW-Org", activeOrg);
   return globalThis.fetch(input, { ...init, headers }).then((res) => {
-    // Only the local sidecar's own 401 means "this window is signed out". A machine or
+    // [中文] 仅本地 sidecar 自身的 401 表示“此窗口已登出”。机器或云调用（/m/… 代理，云路由）返回 401 是该机器的问题，在发起调用的地方处理。
+    // [English] Only the local sidecar's own 401 means "this window is signed out". A machine or
     // cloud call (/m/… proxies, cloud routes) returning 401 is that machine's problem
     // and is handled where the call is made.
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
@@ -80,7 +87,8 @@ const fetch = (
   });
 };
 
-// A Sec-WebSocket-Protocol entry must be an RFC 6455 token — no '@', '=', etc.
+// [中文] Sec-WebSocket-Protocol 条目必须是 RFC 6455 令牌 —— 不能包含 '@', '=' 等字符。桌面令牌（十六进制）和 Auth0 JWT（base64url + 点）符合要求；任何其他内容（开发/测试令牌）使用后端解包的 base64url 信封传递。传递无效的子协议会从构造函数中抛出异常并使渲染变为空白。
+// [English] A Sec-WebSocket-Protocol entry must be an RFC 6455 token — no '@', '=', etc.
 // Desktop tokens (hex) and Auth0 JWTs (base64url + dots) qualify; anything else
 // (dev/test tokens) rides a base64url envelope the backend unwraps. Passing an
 // invalid subprotocol would THROW from the constructor and blank the render.
@@ -101,7 +109,9 @@ const openWebSocket = (url: string): WebSocket => {
     : new WebSocket(target);
 };
 
-// -- remote homes: machine-aware session routing (remote-home-design.md P1c) ---
+// [中文] -- 远程宿主：机器感知会话路由 (remote-home-design.md P1c) ---
+// 位于已加入机器上的会话通过控制器的代理前缀访问 —— “机器只是不同的基础 URL”。这个模块本地映射（由 getAllSessions 和会话创建提供）让下面的每个会话范围辅助函数透明地路由；未知会话解析为本地 sidecar。
+// [English] -- remote homes: machine-aware session routing (remote-home-design.md P1c) ---
 // A session that lives on a joined machine is reached through the controller's
 // proxy prefix — "a machine is just a different base URL". This module-local map
 // (fed by getAllSessions and session creation) lets every session-scoped helper
@@ -117,14 +127,20 @@ export function machineOfSession(sessionId: string): string | null {
   return sessionMachines.get(sessionId) ?? null;
 }
 
-/** Union view (spec §"Union view on the signed-in desktop"): machines from
+/**
+ * [中文] 联合视图（规范 §"登录桌面上的联合视图"）：来自托管云注册表的机器通过 sidecar 的云代理传递。在 GUI 中，它们的 ID 带有 `cloud:` 前缀，因此只有一个映射（此处）决定机器 ID 解析到哪个基础路径，并且每个消费者都继续传递不透明 ID。
+ * [English] Union view (spec §"Union view on the signed-in desktop"): machines from
  * the hosted cloud registry ride the sidecar's cloud proxy. In the GUI their
  * ids wear a `cloud:` prefix, so ONE mapping — here — decides which base a
- * machine id resolves to, and every consumer keeps passing opaque ids. */
+ * machine id resolves to, and every consumer keeps passing opaque ids.
+ */
 export const CLOUD_ID_PREFIX = "cloud:";
 export const isCloudMachineId = (mid: string): boolean => mid.startsWith(CLOUD_ID_PREFIX);
 
-/** Admin base for one machine (rename/remove/sessions/secrets live under it). */
+/**
+ * [中文] 单个机器的管理基础路径（重命名/删除/会话/机密在其下运作）。
+ * [English] Admin base for one machine (rename/remove/sessions/secrets live under it).
+ */
 export const machineApi = (mid: string): string =>
   isCloudMachineId(mid)
     ? `${httpBase()}/v1/cloud/machines/${mid.slice(CLOUD_ID_PREFIX.length)}`
@@ -135,9 +151,12 @@ const machineWsPath = (mid: string): string =>
     ? `/ws/cloud/machines/${mid.slice(CLOUD_ID_PREFIX.length)}/p`
     : `/ws/machines/${mid}/p`;
 
-/** Base URL of an ENGINE: the local sidecar, or a joined machine through the
+/**
+ * [中文] 引擎的基础 URL：本地 sidecar，或通过控制器代理访问的已加入机器 —— “机器只是不同的基础 URL”。受“设置”机器选择器限制的页面会传递所选的机器 ID。
+ * [English] Base URL of an ENGINE: the local sidecar, or a joined machine through the
  * controller's proxy — "a machine is just a different base URL". Pages scoped
- * by the Settings machine picker pass the picked machine id through. */
+ * by the Settings machine picker pass the picked machine id through.
+ */
 export const engineBase = (machineId?: string | null): string =>
   machineId ? `${machineApi(machineId)}/p` : httpBase();
 
@@ -2751,18 +2770,25 @@ export async function getSlackStatus(): Promise<SlackStatus> {
 
 export type Handlers = {
   onEvent: (event: WsEvent) => void;
-  /** `reconnected` is true when this open follows an unexpected drop — the caller
-   * should reload what it may have missed (transcript tail, parked prompts). */
+  // [中文] `reconnected` 在此次连接发生在意外断开之后为 true —— 调用方应重新加载可能遗漏的内容（转录尾部、停放的提示等）。
+  // [English] `reconnected` is true when this open follows an unexpected drop — the caller
+  // should reload what it may have missed (transcript tail, parked prompts).
   onOpen?: (reconnected: boolean) => void;
   onClose?: () => void;
 };
 
-/** Reconnect backoff for a dropped session socket: 1s, 2s, 4s, 8s, then 15s. */
+// [中文] 断开连接后的重连退避时间：1秒、2秒、4秒、8秒，然后是 15秒。
+// [English] Reconnect backoff for a dropped session socket: 1s, 2s, 4s, 8s, then 15s.
 export const SESSION_RECONNECT_MS = [1000, 2000, 4000, 8000, 15000];
 
+/**
+ * [中文] 核心会话 WebSocket 封装类，管理与后端的双向长连接生命周期、事件分发以及停放卡片的交互响应。
+ * [English] Core session WebSocket wrapper class, managing the bidirectional long-connection lifecycle, event dispatch, and card interaction responses.
+ */
 export class Session {
   private ws!: WebSocket;
-  // Payloads sent before the socket finished opening, replayed on `onopen`. Belt-and-suspenders
+  // [中文] 在套接字完成打开之前发送的有效载荷，在 `onopen` 时重放。防止在连接窗口期间用户发送消息导致首条消息丢失。
+  // [English] Payloads sent before the socket finished opening, replayed on `onopen`. Belt-and-suspenders
   // against the first message being dropped if the user sends in the connect window.
   private outbox: object[] = [];
   private readonly url: string;
@@ -2779,7 +2805,8 @@ export class Session {
     machine?: string | null,
   ) {
     const q = `?workspace=${encodeURIComponent(workspace)}&agent=${encodeURIComponent(agent)}`;
-    // Remote homes: a session on a joined machine rides the bridged socket —
+    // [中文] 远程宿主：已加入机器上的会话运行在桥接套接字上 —— 相同的协议，不同的基础路径（控制器将其拼接到盒子）。
+    // [English] Remote homes: a session on a joined machine rides the bridged socket —
     // same protocol, different base path (the controller splices it to the box).
     const path = machine
       ? `${machineWsPath(machine)}/ws/session/${sessionId}`
@@ -2789,10 +2816,13 @@ export class Session {
     this.connect();
   }
 
-  /** Open (or re-open) the socket. A drop the caller did not ask for schedules a retry
+  /**
+   * [中文] 打开（或重新打开）Socket 连接。非调用方主动触发的断开连接会按上限指数退避调度重试 —— 桥接机器会话跨越两个中继段（控制器 + 机器），任何一方重启过去都会使视图失去响应直到用户离开页面。
+   * [English] Open (or re-open) the socket. A drop the caller did not ask for schedules a retry
    * with capped backoff — a bridged machine session rides two hops (controller + box),
    * and either one restarting used to leave the view dead until the user navigated
-   * away (ledger 2026-09-01: the v14 rollover blanked the bridged view). */
+   * away (ledger 2026-09-01: the v14 rollover blanked the bridged view).
+   */
   private connect() {
     if (this.closed) return;
     const reconnected = this.attempts > 0;
@@ -2832,10 +2862,13 @@ export class Session {
     else if (this.ws.readyState === WebSocket.CONNECTING) this.outbox.push(payload);
   }
 
-  /** `model` = the composer's CURRENT selection, carried on every message so the turn uses
+  /**
+   * [中文] 发送用户消息。`model` 为输入框的当前选定模型，随每条消息携带，以免疫重连时的竞争状态（新会话重连以采用暂存目录时可能丢弃排队的 set_model，导致引擎停留在过期模型上）。
+   * [English] `model` = the composer's CURRENT selection, carried on every message so the turn uses
    * exactly what the user sees — immune to set_model races across reconnects (a new cowork
    * session always reconnects once to adopt its scratch dir, which could drop a queued
-   * set_model and leave the engine on a stale/resumed model; found 2026-07-04). */
+   * set_model and leave the engine on a stale/resumed model; found 2026-07-04).
+   */
   userMessage(text: string, attachments?: unknown[], model?: string, skill?: string) {
     this.send({
       type: "user_message",
@@ -2852,34 +2885,42 @@ export class Session {
     this.send(approvalMessage(decision));
   }
 
-  /** §8.4 "Allow anyway": register a ONE-SHOT exact-action approval for a reviewer-denied
-   *  tool call. The caller follows up with a normal user message so the agent retries. */
+  /**
+   * [中文] §8.4 "无论如何允许"：为被审查器拒绝的工具调用注册单次精确操作审批。调用方随后发送正常用户消息让智能体重试。
+   * [English] §8.4 "Allow anyway": register a ONE-SHOT exact-action approval for a reviewer-denied
+   *  tool call. The caller follows up with a normal user message so the agent retries.
+   */
   allowAnyway(name: string, args: any) {
     this.send({ type: "allow_anyway", name, arguments: args ?? {} });
   }
 
-  // Reply to a `request_directory` prompt: grant a folder (with access level) or decline.
+  // [中文] 响应 `request_directory` 提示：授予文件夹（附带访问级别）或拒绝。
+  // [English] Reply to a `request_directory` prompt: grant a folder (with access level) or decline.
   respondDirectory(granted: boolean, path?: string, writable?: boolean) {
     this.send(directoryResponseMessage(granted, path, writable));
   }
 
-  // Reply to a `request_tool` prompt: install the pinned build, or skip the check.
+  // [中文] 响应 `request_tool` 提示：安装固定的构建版本，或跳过检查。
+  // [English] Reply to a `request_tool` prompt: install the pinned build, or skip the check.
   respondTool(approved: boolean) {
     this.send(toolResponseMessage(approved));
   }
 
-  // Reply to a `propose_plan` prompt: approve (choosing the execution mode) or reject with feedback.
+  // [中文] 响应 `propose_plan` 提示：批准（选择执行模式）或附带反馈意见拒绝。
+  // [English] Reply to a `propose_plan` prompt: approve (choosing the execution mode) or reject with feedback.
   respondPlan(approved: boolean, mode?: string, feedback?: string) {
     this.send(planResponseMessage(approved, mode, feedback));
   }
 
-  // Spec §11.6: the human's per-worker decisions ride the response — connectors ticked
+  // [中文] 规范 §11.6: 人类对每个工作者的决定随响应发送 —— 卡片上勾选的连接器（在提供的上限内）和审批模式；按花名册索引索引。
+  // [English] Spec §11.6: the human's per-worker decisions ride the response — connectors ticked
   // on the card (within the offered ceiling) and the approval mode; by roster index.
   respondTeam(approved: boolean, feedback?: string, enableChat?: boolean, members?: TeamMemberDecision[]) {
     this.send(teamResponseMessage(approved, feedback, enableChat, members));
   }
 
-  // Reply to a `request_connector` / `grant_connector` prompt.
+  // [中文] 响应 `request_connector` / `grant_connector` 提示。
+  // [English] Reply to a `request_connector` / `grant_connector` prompt.
   respondConnector(approved: boolean) {
     this.send(connectorResponseMessage(approved));
   }
@@ -2888,7 +2929,8 @@ export class Session {
     this.send(itemsResponseMessage(approved, feedback));
   }
 
-  // Answer a live `ask_user` prompt (attended sessions; unattended ones answer via the Inbox).
+  // [中文] 回答实时的 `ask_user` 提问（有人值守会话直接回答；无人值守会话通过收件箱回答）。
+  // [English] Answer a live `ask_user` prompt (attended sessions; unattended ones answer via the Inbox).
   respondQuestion(answer: string) {
     this.send(questionResponseMessage(answer));
   }
@@ -2897,7 +2939,8 @@ export class Session {
     this.send({ type: "interrupt" });
   }
 
-  // Re-run a turn that ended in a provider error — no new user message; the server
+  // [中文] 重新运行以提供商错误结束的轮次 —— 不产生新的用户消息；服务端通过历史尾部保护，杂散帧为空操作。
+  // [English] Re-run a turn that ended in a provider error — no new user message; the server
   // guards on the history tail so a stray frame is a no-op.
   retry() {
     this.send({ type: "retry" });
@@ -2912,7 +2955,8 @@ export class Session {
   }
 
   close() {
-    // Detach before closing: this socket's async `close` event may land AFTER the
+    // [中文] 在关闭前解绑：此套接字的异步 `close` 事件可能在后续会话的 `open` 之后到达，被销毁的套接字绝不能破坏新套接字的连接状态。
+    // [English] Detach before closing: this socket's async `close` event may land AFTER the
     // successor session's `open` (observed when switching into an automation-run
     // session), and a torn-down socket must not clobber the new one's connected state.
     this.closed = true;

@@ -1,5 +1,8 @@
-"""FastAPI app — OpenAI-compatible endpoint + WS session API + REST.
+"""FastAPI 应用 — OpenAI 兼容端点 + WebSocket 会话 API + REST 接口。
+FastAPI app — OpenAI-compatible endpoint + WS session API + REST.
 
+所有前端交互界面（GUI / IDE / 消息系统）所依托的控制平面。WebSocket 承载引擎的事件流与审批通道；
+`/v1/chat/completions` 是兼容 OpenAI 的代理端点，使得任何 OpenAI 格式的客户端均可将此运行时作为后端使用。
 The control plane every surface (GUI/IDE/messaging) rides on. The WS carries the engine
 event stream and the approval channel; `/v1/chat/completions` is the OpenAI-compatible
 proxy so any OpenAI-format client can use the runtime as a backend.
@@ -24,6 +27,12 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+# 允许与本地 sidecar 通信的来源。它绑定到 127.0.0.1，但用户自己浏览器中的网页仍能访问回环地址 —
+# 因此如果没有来源网关，他们访问的任何恶意网站都可以读取 `GET /v1/sessions`（此前 CORS 为 `*`），
+# 并通过 WS（CORS 永远无法覆盖）驱动会话调用 shell/file 工具。
+# 我们将其固定到桌面 webview 自己的来源（`tauri://localhost`、Windows 的 `http(s)://tauri.localhost`）
+# 以及 localhost 开发/浏览器构建。没有 Origin 头的请求（curl、原生客户端、测试、服务器间调用）被允许 —
+# 网关专门针对浏览器，浏览器总是会附带不可伪造的 Origin。
 # Origins allowed to talk to the local sidecar. It binds to 127.0.0.1, but a page in the
 # user's own browser can still reach loopback — so without an origin gate, any website they
 # visit could read `GET /v1/sessions` (CORS was `*`) and drive a session over the WS (which
@@ -40,10 +49,13 @@ _ALLOWED_ORIGIN_RE = re.compile(
 
 
 def _origin_allowed(origin: str | None) -> bool:
-    """True if a browser Origin may use the API. Missing Origin (non-browser) passes."""
+    """如果浏览器的 Origin 允许使用该 API 则返回 True。缺失 Origin（非浏览器）则放行。
+    True if a browser Origin may use the API. Missing Origin (non-browser) passes."""
     return origin is None or bool(_ALLOWED_ORIGIN_RE.match(origin))
 
 
+# 针对入站 WebSocket 流量的上限限制。回环 socket 是未认证的（任何本地进程都可以访问），
+# 因此在构建模型内容或启动轮次之前，限制帧大小、消息数量和单连接请求速率。
 # Caps on inbound WebSocket traffic. The loopback socket is unauthenticated (any local
 # process can reach it), so bound frames, messages, and per-connection request rate before
 # building model content or starting a turn.
@@ -51,20 +63,23 @@ _WS_MAX_FRAME_BYTES = 16 * 1024 * 1024
 _WS_RATE_LIMIT_COUNT = 30
 _WS_RATE_LIMIT_WINDOW_SECONDS = 10.0
 _MAX_MESSAGE_TEXT_CHARS = 200_000
-_MAX_ATTACHMENTS_BYTES = 15_000_000  # leaves JSON overhead below the 16 MiB frame cap
+_MAX_ATTACHMENTS_BYTES = 15_000_000  # 为 JSON 保留开销，控制在 16 MiB 帧上限之下 / leaves JSON overhead below the 16 MiB frame cap
 
 
 def _json_value_size(value: Any) -> int:
-    """Conservative UTF-8 size of parsed JSON without allocating another giant string."""
+    """保守估算已解析 JSON 的 UTF-8 字节大小，避免分配另一个巨大的临时字符串。
+    Conservative UTF-8 size of parsed JSON without allocating another giant string."""
     if isinstance(value, str):
         return len(value.encode("utf-8"))
     if isinstance(value, dict):
         return sum(_json_value_size(k) + _json_value_size(v) for k, v in value.items())
     if isinstance(value, list):
         return sum(_json_value_size(v) for v in value)
-    return 8  # numbers, booleans, null, separators
+    return 8  # 数字、布尔值、null、分隔符 / numbers, booleans, null, separators
 
 
+# 依附在 ✓ 图标上的连接器徽标品牌颜色（UX-DECISIONS §30）。GUI 拥有真实徽标；
+# 该页面必须在零静态资产的情况下离线渲染，因此使用彩色首字母作为替代。
 # Brand colors for the connector badge riding the ✓ (UX-DECISIONS §30). The GUI owns the
 # real logos; this page must render offline with zero assets, so a colored initial stands in.
 _BRAND_COLORS = {
@@ -79,7 +94,12 @@ _BRAND_COLORS = {
 def _browser_page(
     title: str, detail: str, *, ok: bool = True, error: str = "", connector: str = ""
 ) -> str:
-    """The page shown in the user's browser at the end of a loopback flow (sign-in or
+    """回环流程（登录或连接器回调）结束时在用户浏览器中显示的页面 —
+    单张品牌卡片（UX-DECISIONS §30）：OCW 标识、成功/失败图标（连接器首字母依附在 ✓ 上）、
+    友好的详情说明，并在失败时保留原始错误（它是排障线索）。内联 CSS，通过 prefers-color-scheme 支持浅色/深色主题，
+    无外部静态资源 — 必须能离线渲染。
+
+    The page shown in the user's browser at the end of a loopback flow (sign-in or
     connector callback) — one branded card (UX-DECISIONS §30): OCW mark, ok/fail icon
     (the connector's initial rides the ✓), the friendly detail, and the raw error
     preserved on failures (it's the debugging breadcrumb). Inline CSS, light/dark via
@@ -138,7 +158,8 @@ def _browser_page(
 
 
 def _connector_title(name: str) -> str:
-    """Display name for the loopback page — 'Slack connected', never 'slack connected'."""
+    """回环页面的展示名称 — 如 'Slack connected'，绝非 'slack connected'。
+    Display name for the loopback page — 'Slack connected', never 'slack connected'."""
     from ..connectors.descriptors import get_descriptor
 
     d = get_descriptor(name)
@@ -171,20 +192,22 @@ from .manager import SessionManager, _approval_body
 
 
 def create_app(manager: SessionManager) -> FastAPI:
+    """创建并配置 FastAPI 控制平面应用。
+    Create and configure the FastAPI control plane application."""
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         try:
             live = (
                 await manager.start_gateway()
-            )  # start messaging listeners (if configured)
+            )  # 启动消息监听器（若已配置）/ start messaging listeners (if configured)
             if live:
                 print(f"[coworker] messaging gateway live: {', '.join(live)}")
-        except Exception:  # never let a bad connector stop the server
+        except Exception:  # 绝不让有问题的连接器阻塞服务器启动 / never let a bad connector stop the server
             import traceback
 
             traceback.print_exc()
         yield
-        await manager.aclose()  # stop gateway + close MCP connections on shutdown
+        await manager.aclose()  # 关机时停止网关并关闭 MCP 连接 / stop gateway + close MCP connections on shutdown
 
     app = FastAPI(title="coworker", version="0.0.0", lifespan=lifespan)
     api_token = os.environ.get("COWORKER_API_TOKEN", "")
@@ -193,6 +216,7 @@ def create_app(manager: SessionManager) -> FastAPI:
         "/auth/callback",
         "/mcp/oauth/callback",
         "/oauth/callback",
+        # 设备授权流程中面向机器的端点（`openworker auth join`）：该机器不持有 sidecar 令牌。审批仍受把关。
         # Machine-facing halves of the device-authorization flow (`openworker
         # auth join`): the box holds no sidecar token. Approval stays gated.
         "/v1/remote/device/start",
@@ -200,6 +224,8 @@ def create_app(manager: SessionManager) -> FastAPI:
     }
 
     def _request_authenticated(request: Request) -> bool:
+        """检查 HTTP 请求是否携带有效的 sidecar 认证令牌。
+        Check if HTTP request carries a valid sidecar auth token."""
         provided = request.headers.get("x-openworker-token", "")
         return bool(
             api_token
@@ -208,6 +234,8 @@ def create_app(manager: SessionManager) -> FastAPI:
         )
 
     def _websocket_authenticated(ws: WebSocket) -> bool:
+        """检查 WebSocket 握手协议是否携带有效的 sidecar 认证令牌。
+        Check if WebSocket handshake protocol carries a valid sidecar auth token."""
         if not api_token:
             return True
         protocols = {
@@ -219,16 +247,22 @@ def create_app(manager: SessionManager) -> FastAPI:
 
     @app.middleware("http")
     async def require_sidecar_token(request: Request, call_next):
+        # 预检请求（Preflight）携带的是请求的请求头名称而非其值。CORS 检查 Origin；
+        # 实际修改状态的请求仍然必须通过认证。
         # Preflights carry the requested header name, not its value. CORS checks the
         # Origin; the actual state-changing request still must authenticate.
         if (
             not api_token
             or request.method == "OPTIONS"
             or request.url.path in tokenless_paths
+            # `/v1/board` 携带自己的更强认证：按 actor 划分的看板令牌（身份 + 权限），
+            # 设计用于分发给外部 harness 和其他机器 — 它们永远无法持有机器本地的 sidecar 令牌。
             # `/v1/board` carries its own, stronger auth: per-actor board tokens
             # (identity + access), designed to be handed to external harnesses and
             # other machines — which can never hold the machine-local sidecar token.
             or request.url.path.startswith("/v1/board/")
+            # 加入 URL 提示页面：由远程机器上的人类阅读（那里没有 sidecar 令牌）；
+            # 提供固定说明，不进行校验。
             # Join-URL hint page: read by a human on a remote box (no sidecar
             # token there); serves constant instructions, validates nothing.
             or request.url.path.startswith("/j/")
@@ -2479,9 +2513,13 @@ def create_app(manager: SessionManager) -> FastAPI:
 
     @app.websocket("/ws/session/{session_id}")
     async def ws_session(ws: WebSocket, session_id: str) -> None:
+        """主会话 WebSocket 端点 — 双向事件流、审批交互与用户指令处理。
+        Main session WebSocket endpoint — bidirectional event stream, approvals, and user turns."""
         if not _websocket_authenticated(ws):
             await ws.close(code=1008)
             return
+        # CORS 永远无法限制 WebSocket，否则跨站网页可以打开此 socket 并驱动会话进行工具调用。
+        # 在接受握手之前拒绝未受允许的浏览器 Origin（1008 = 策略违规）。
         # CORS never gates WebSockets, so a cross-site page could otherwise open this socket
         # and drive the session into tool calls. Reject a disallowed browser Origin before
         # accepting the handshake (1008 = policy violation).
@@ -2490,11 +2528,19 @@ def create_app(manager: SessionManager) -> FastAPI:
             return
         await ws.accept(subprotocol="openworker" if api_token else None)
         agent = ws.query_params.get("agent") or "code"
+        # 会话执行者 actor（规范 §Fleet under the org）：只有 channel bridge 才能提供此请求头
+        # （已加入的机器没有监听器），且控制器根据其验证的登录设置该值。先写者胜。
         # Session actor (spec §Fleet under the org): only the channel bridge can
         # present this header (a joined box has no listener), and the controller
         # sets it from the login it verified. First writer wins.
         manager.note_session_actor(session_id, ws.headers.get("x-openworker-actor", ""))
 
+        # 所有四类交互式提示（审批 approval / 提问 question / 目录请求 directory / 方案审批 plan）
+        # 均停泊（park）为收件箱条目，并通过 inbox.wait 异步等待 —
+        # 因此即使 socket 断开它们也能幸存（重连时重新交付），并可从任意交互界面完成解决。
+        # `visibility` 决定它们在哪里展示：
+        # 无人值守 Unattended → 跨会话收件箱；有人值守 attended → 仅在当前会话中内联显示。
+        # 在条目被解决（实时 WS 响应、REST 接口或绑定的 channel）前，智能体保持挂起阻塞。
         # All four interactive prompts (approval / question / directory / plan) are parked as Inbox
         # items and awaited via inbox.wait — so they survive a dropped socket (redelivered on
         # reconnect) and can be resolved from any surface. `visibility` decides where they SHOW:
@@ -2508,6 +2554,7 @@ def create_app(manager: SessionManager) -> FastAPI:
             )
 
         async def _mirror(item) -> None:
+            # 无人值守条目以按钮形式镜像到绑定的 channel（参见 mirror_inbox_item）。
             # Unattended items mirror to a bound channel as buttons (see mirror_inbox_item).
             await manager.mirror_inbox_item(item)
 
@@ -2515,22 +2562,27 @@ def create_app(manager: SessionManager) -> FastAPI:
             return manager.inbox_routing.route_for(session_id, agent)
 
         async def approver(_request) -> ApprovalOutcome:
+            # 引擎已经发出了 PERMISSION_REQUIRED 事件（即实时内联卡片）。
+            # 停泊该条目，以便答案也可以来自收件箱 / 重连后 / 重启后。
             # The engine has already emitted PERMISSION_REQUIRED (the live inline card). Park the
             # item so the answer can also come from the Inbox / a reconnect / after a restart.
             item = manager.inbox.add_approval(
                 session_id,
                 f"Run `{_request.tool_name}`?",
+                # 与 inbox_approver 共享，使停泊/镜像的消息体与实时卡片的表达格式保持一致（包含样板原因过滤，§35）。
                 # Shared with inbox_approver so parked/mirrored bodies match the live
                 # card's dialect (boilerplate-reason filtering included, §35).
                 body=_approval_body(_request),
                 inbox=_route(),
                 visibility=_visibility(),
+                # 自动化运行上下文（手动“立即运行”复用该 socket）：允许卡片提供按任务持久化的“每次均允许”（§25）。其余情况为 {}。
                 # Automation-run context (manual "Run now" rides this socket): lets the
                 # card offer the task-persistent "Allow every time" (§25). {} elsewhere.
                 data=manager.approval_prompt_data(session_id, _request),
                 tool_call_id=getattr(_request, "tool_call_id", None),
             )
             if item.state == "pending":
+                # §11.6: 在手动 Lead 模式下停泊于此的 Worker — 通过看板通知其 Lead 决策所需内容（提示 ID 即 call_id）。
                 # §11.6: a worker parked here under a Manual lead — tell its lead via the
                 # board, with what it needs to decide (the prompt id is the call_id).
                 manager.note_worker_waiting(
@@ -2541,23 +2593,26 @@ def create_app(manager: SessionManager) -> FastAPI:
                 )
             if (
                 item.state == "pending"
-            ):  # freshly raised (not a durable-resume re-raise)
+            ):  # 新鲜抛出（而非持久化恢复重新抛出）/ freshly raised (not a durable-resume re-raise)
                 manager.persist_session(
                     session_id
-                )  # the pending tool call is now on disk
+                )  # 挂起的工具调用现已写入磁盘 / the pending tool call is now on disk
                 if item.visibility == VIS_INBOX:
                     await _mirror(item)
             resolution = await manager.inbox.wait(item.id)
+            # 兼容所有输入词汇：实时卡片发送 once/always_tool/always_command/always_task/deny；
+            # 收件箱或 channel 发送 allow/always/deny。
             # Accept every vocabulary: the live card sends once/always_tool/always_command/
             # always_task/deny; the Inbox / a channel send allow/always/deny.
             return manager.approval_outcome(resolution, _request, session_id)
 
         async def question_asker(args: dict, tool_call_id=None) -> dict:
+            # 向用户提问（引擎不抛出事件 — 由我们在有人值守时抛出）。
             # ask_user (engine does NOT emit the event — we do, only when attended).
             from ..tools.ask import answer_result, question_item_fields
 
             fields = question_item_fields(args)
-            if fields is None:  # engine guards too; belt-and-braces
+            if fields is None:  # 引擎端也有防护；双重保障 / engine guards too; belt-and-braces
                 return {"answer": "", "error": "no question"}
             item = manager.inbox.add_question(
                 session_id,
@@ -2588,7 +2643,12 @@ def create_app(manager: SessionManager) -> FastAPI:
             return answer_result(item.questions, await manager.inbox.wait(item.id))
 
         async def tool_requester(args: dict, tool_call_id=None) -> dict:
-            """Park a TOOL_REQUESTED prompt, then install the PINNED build if approved.
+            """停泊 TOOL_REQUESTED 提示，若获批则安装固定构建版本（PINNED build）。
+
+            拒绝是一种一等结果：提示智能体回退并说明缺口，而非放弃检查（OPE-85）。
+            安装仅来自于校验过摘要的固定注册中心 — 批准是同意安装该特定构件，而非授予下载提示所要求的任何内容的许可。
+
+            Park a TOOL_REQUESTED prompt, then install the PINNED build if approved.
 
             Declining is a first-class outcome: the agent is told to fall back and disclose
             the gap rather than drop the check (OPE-85). Installs only ever come from the
@@ -2598,6 +2658,8 @@ def create_app(manager: SessionManager) -> FastAPI:
             name = str(args.get("name", "")).strip()
             info = toolchain.describe(name)
             if not info:
+                # 不在固定工具目录中：绝不显示在审批后只能以“无固定构建”收场的安装卡片（2026-08-20 踩坑 — 智能体试图通过卡片走普通 brew/pip 安装）。
+                # 引导其使用具备专门审批流程的 shell 工具。
                 # Not in the pinned catalog: never show an install card that can only
                 # end in "no pinned build" AFTER approval (owner-hit 2026-08-20 — agents
                 # routed ordinary brew/pip installs through the card). Steer to the
@@ -2649,6 +2711,7 @@ def create_app(manager: SessionManager) -> FastAPI:
             return {"installed": True, "path": path, "version": info["version"]}
 
         async def directory_requester(args: dict, tool_call_id=None) -> dict:
+            # 引擎已经发出了 DIRECTORY_REQUESTED。停泊、等待，然后应用授权。
             # The engine has already emitted DIRECTORY_REQUESTED. Park, await, then apply the grant.
             item = manager.inbox.add_directory(
                 session_id,
@@ -2677,6 +2740,8 @@ def create_app(manager: SessionManager) -> FastAPI:
                 return {"granted": False, "error": "no directory was provided"}
             writable = bool(resp.get("writable", args.get("writable", False)))
             if bool(args.get("primary", False)):
+                # 根目录提升（Root promotion，workspace-scratch-design.md §5）— 内部的 shell cd
+                # 是阻塞操作，保持在事件循环之外（使用 to_thread）。
                 # Root promotion (workspace-scratch-design.md §5) — the shell cd inside
                 # is blocking, keep it off the event loop.
                 promo = await asyncio.to_thread(
@@ -2693,6 +2758,7 @@ def create_app(manager: SessionManager) -> FastAPI:
                             "of this turn, address it by absolute path."
                         ),
                     }
+                # 提升被拒绝（例如该会话已有主工作区）：仍将授权作为普通附加目录兑现。
                 # Promotion refused (e.g. the session already has a workspace): still
                 # honor the grant as a plain additional folder.
                 res = manager.add_root(session_id, path, writable)
@@ -2732,6 +2798,7 @@ def create_app(manager: SessionManager) -> FastAPI:
             }
 
         async def plan_approver(_args: dict, tool_call_id=None) -> dict:
+            # 引擎已经发出了 PLAN_PROPOSED。停泊计划，等待裁决。
             # The engine has already emitted PLAN_PROPOSED. Park, await the verdict.
             item = manager.inbox.add_plan(
                 session_id,
@@ -2755,6 +2822,8 @@ def create_app(manager: SessionManager) -> FastAPI:
                 }
             return {"approved": True, "mode": resp.get("mode") or "interactive"}
 
+        # §11.6: 连接器请求与团队关口现已作为管理器处理程序（它们在后台轮次中也必须工作）；
+        # socket 仅提供有人值守的可见性，以便在有人观察时内联渲染提示。
         # §11.6: the connector asks and the team gates are manager handlers now (they
         # must work on background turns too); the socket only supplies attended
         # visibility so the prompt renders inline when someone is watching.
@@ -2764,6 +2833,10 @@ def create_app(manager: SessionManager) -> FastAPI:
 
         items_approver = manager.inbox_items_approver(session_id, agent, visibility=_visibility)
         async def _apply_model(model: Optional[str]) -> None:
+            # 允许在会话中期重新绑定模型（路线图第 3 项，取代 2026-07-04 的锁定）：
+            # 历史记录是规范的，Provider 在每次调用时转换。真正的切换会追加一条持久化的通知；
+            # 广播此通知以使实时视图渲染标记并更新其头部。
+            # 绝不在轮次进行中重新绑定 — 运行中的循环在每次迭代时读取 `engine.model`，混合轮次正是旧锁定所防止的破坏。
             # Mid-session rebind is allowed (roadmap item 3, supersedes the 2026-07-04
             # lock): history is canonical and providers convert per call. A real switch
             # appends a persisted notice; broadcast it so live views render the marker
@@ -2772,11 +2845,12 @@ def create_app(manager: SessionManager) -> FastAPI:
             # old lock existed to prevent.
             if not model or manager.is_running(session_id):
                 return
+            # 绑定 coworker 的 `models:` 列表（§4）：该列表之外的模型解析为列表的第一个可运行条目，无论客户端请求什么。
             # The coworker's `models:` list binds (§4): a model outside it resolves to
             # the list's first runnable entry, whatever the client asked for.
             model = manager.resolve_persona_model(getattr(engine, "agent_name", "") or "", model)
             notice = engine.switch_model(model)
-            if notice is None:  # same model, or first bind on a fresh session
+            if notice is None:  # 相同模型，或新会话上的首次绑定 / same model, or first bind on a fresh session
                 return
             manager.persist_session(session_id)
             await manager.broadcast_session(
@@ -2787,6 +2861,8 @@ def create_app(manager: SessionManager) -> FastAPI:
         viewer_actor = ws.headers.get("x-openworker-actor", "")
 
         def _resolve_pending(resolution: str) -> None:
+            # 实时 WS 响应解决当前会话的唯一挂起提示（由于智能体阻塞，一次只有一个）。
+            # 重连或收件箱则通过 REST 按 ID 解决。决策者是此 socket 经过验证的查看者（桥接会话）— 本地桌面上为 ""。
             # Live WS responses resolve THE session's single pending prompt (one at a time, since the
             # agent blocks). Reconnect / Inbox resolve by id via REST instead. The decider is this
             # socket's verified viewer (bridged sessions) — "" on a local desktop.
@@ -2823,11 +2899,13 @@ def create_app(manager: SessionManager) -> FastAPI:
             )
             await ws.close()
             return
+        # 在为当前会话准备工具时未能启动的 MCP 服务器：留下安静的持久通知，而不是让会话默默缺少它们（2026-08-20 演练：连续三次静默启动失败）。
         # MCP servers that failed to start while preparing this session's tools:
         # leave a quiet, persistent notice instead of the session silently lacking
         # them (drill 2026-08-20: three silent startup failures in a row).
         for name, err in manager.pop_mcp_failures(session_id):
             detail = f": {err}" if err else ""
+            # `server` 使得通知具备结构化：GUI 渲染一行安静的文本，完整错误隐藏在折叠项后 + 提供“打开连接器”操作（2026-08-21 决策），而非一整面 stderr 错误墙。
             # `server` makes the notice structured: the GUI renders one quiet line
             # with the full error behind a disclosure + an Open-Connectors action
             # (owner ruling 2026-08-21) instead of a wall of stderr.
@@ -2836,6 +2914,8 @@ def create_app(manager: SessionManager) -> FastAPI:
                 f"MCP server “{name}” failed to start{detail}"[:500],
                 server=name,
             )
+        # 自动压缩失败提示（OPE-27）：只有有人值守的会话才能询问 Retry/Trim — 无人值守的运行会自动裁剪（engine._compact_now 中的策略）。
+        # §11.5/§11.6: 人类选择进入自动批准的会话（生成的会话配置，或处于自动批准 Lead 下的 Worker）即使无人值守也会被审查。
         # Auto-compaction failure prompt (OPE-27): only an ATTENDED session may be asked
         # Retry/Trim — unattended runs auto-trim (the policy in engine._compact_now).
         # §11.5/§11.6: a session the human opted into auto-approve (a spawned session's
@@ -2873,6 +2953,10 @@ def create_app(manager: SessionManager) -> FastAPI:
             }
         )
 
+        # 检查点事件：在轮次中途进行持久化，防止崩溃或退出导致对话丢失。
+        # turn_start = 用户消息刚到达（全新会话在此处落盘记录，而非连接时 — 空的从未使用过的会话不应出现在“最近会话”列表中）；
+        # permission_required / directory_requested = 无限期停泊等待用户；
+        # iteration_end = 模型单次响应及其工具结果全部执行完毕。
         # Checkpoint events: persist mid-turn so a crash/quit can't eat the conversation.
         # turn_start = the user message just landed (a brand-new session gets its row here,
         # not at connect — empty never-used sessions shouldn't appear in Recents);
@@ -2887,6 +2971,8 @@ def create_app(manager: SessionManager) -> FastAPI:
         }
 
         async def run_turn(content, *, retry: bool = False, display=None) -> None:
+            # 接收循环在调度任务之前原子性地认领当前会话。
+            # 将认领逻辑放在外部可防止两个连续到达的帧同时触发执行。
             # The receive loop atomically claims this session before scheduling the task.
             # Keeping the claim outside prevents two back-to-back frames from both starting.
             try:
@@ -2898,6 +2984,8 @@ def create_app(manager: SessionManager) -> FastAPI:
                 )
                 async for event in events:
                     data = event.data
+                    # 广播到查看此会话的所有 socket（包括当前 socket — 它也是已注册的客户端），
+                    # 这样同一会话的第二个视图也能保持完全同步。
                     # Broadcast to every socket viewing this session (this socket included — it's a
                     # registered client), so a second view of the same session stays in sync too.
                     await manager.broadcast_session(
@@ -2906,6 +2994,7 @@ def create_app(manager: SessionManager) -> FastAPI:
                     if event.type.value in _CHECKPOINTS:
                         manager.save(session_id, engine)
                     if event.type.value == "turn_start":
+                        # 在用户文字到达的瞬间立刻拟定标题 — 绝不延迟到漫长的智能体轮次之后（2026-08-24 踩坑修复）。
                         # Title on the user's words the moment they land — never behind
                         # a long agentic turn (owner catch 2026-08-24).
                         manager._maybe_autotitle(session_id)
@@ -2916,6 +3005,8 @@ def create_app(manager: SessionManager) -> FastAPI:
                     session_id, {"type": "turn_done", "data": {}}
                 )
 
+        # 当前 socket 现已成为会话的实时视图；后台轮次（channel 交付、自唤醒 self-wake、持久化恢复）
+        # 也会广播到此处，而不仅限于本地驱动的 run_turn。
         # This socket is now a live view of the session; background turns (channel delivery,
         # self-wake, durable resume) broadcast here too, not just locally driven run_turns.
         manager.register_session_client(session_id, ws.send_json)
@@ -2927,7 +3018,7 @@ def create_app(manager: SessionManager) -> FastAPI:
             engine._append_notice(
                 "mode_notice", AUTO_APPROVE_NOTICE, title="Auto-approve is on."
             )
-            manager.save(session_id, engine, touch=False)  # migration ≠ activity
+            manager.save(session_id, engine, touch=False)  # 迁移 ≠ 用户活动 / migration ≠ activity
             await ws.send_json(
                 {
                     "type": "mode_notice",
@@ -2940,6 +3031,7 @@ def create_app(manager: SessionManager) -> FastAPI:
         inbound_times: deque[float] = deque()
 
         async def reject_input(reason: str) -> None:
+            # 输入校验失败不是模型提供商的故障，绝不能在 GUI 中提供“重试”或冲刷正在生成中的助手文本流。
             # Input validation failures are not provider failures and must not offer "Retry"
             # or flush an in-progress assistant stream in the GUI.
             await ws.send_json({"type": "input_rejected", "data": {"error": reason}})
@@ -3031,6 +3123,9 @@ def create_app(manager: SessionManager) -> FastAPI:
                 elif kind == "question_response":
                     _resolve_pending(str(message.get("answer", "")))
                 elif kind == "allow_anyway":
+                    # §8.4: 用户在审查员拒绝的工具卡片上点击了“无论如何均允许”。
+                    # 在引擎上注册一次单次精确操作的批准；然后 GUI 通过常规 user_message 路径
+                    # 发送预设的重试消息，重新提出的相同操作在无需审查员/卡片的情况下直接执行。
                     # §8.4: the user clicked "Allow anyway" on a reviewer-denied tool card.
                     # Registers a ONE-SHOT exact-action approval on the engine; the GUI then
                     # sends its canned retry message through the normal user_message path,
@@ -3046,6 +3141,8 @@ def create_app(manager: SessionManager) -> FastAPI:
                 elif kind == "interrupt":
                     manager.stop_session(session_id)
                 elif kind == "retry":
+                    # 在 Provider 发生错误后重新运行（引擎对错误通知末尾进行防护，
+                    # 因此多余的帧是空操作，仍以 turn_done 结束）。
                     # Re-run after a provider error (engine guards on the error-notice
                     # tail, so a stray frame is a no-op that still ends with turn_done).
                     await claim_turn(retry=True)
@@ -3061,6 +3158,9 @@ def create_app(manager: SessionManager) -> FastAPI:
                             manager.audit_autonomy_change(
                                 session_id, "mode", previous.value, new_mode.value
                             )
+                            # 对话转录本记录每个交互轮次在何种模式下运行（2026-08-24 决策）：
+                            # 会话首次进入 Auto-Approve 时记录完整说明，其余情况记录单行标记。
+                            # 由服务器端编写并持久化，以便重新加载时恰好显示一次，而不会在每次重启时重复公告。
                             # The transcript records which mode each exchange ran under
                             # (owner ruling 2026-08-24): full explainer the first time a
                             # session enters Auto-Approve, a one-line marker otherwise.
@@ -3092,6 +3192,8 @@ def create_app(manager: SessionManager) -> FastAPI:
                                     "mode_switch", f"{label} is on."
                                 )
                                 notice_data = {"text": f"{label} is on."}
+                            # 没有伴随消息的模式切换属于记账操作，不算用户活动（2026-08-24 决策）：
+                            # 转录本记录它，Recents 不会重新排序。下一个真实轮次的检查点保存会像往常一样更新活跃度。
                             # A mode switch with no accompanying message is bookkeeping,
                             # not activity (owner ruling 2026-08-24): the transcript
                             # records it, Recents doesn't reorder. The next real turn's
@@ -3118,6 +3220,7 @@ def create_app(manager: SessionManager) -> FastAPI:
                     text = raw_text.strip()
                     raw_attachments = message.get("attachments")
                     attachments = [] if raw_attachments is None else raw_attachments
+                    # 拒绝超大帧，而非将其缓冲到轮次中。发送可见错误以便交互界面提示用户，并丢弃该消息。
                     # Reject an oversized frame instead of buffering it into a turn. Send a
                     # visible error so the surface can tell the user, and drop the message.
                     if not isinstance(attachments, list):
@@ -3184,6 +3287,8 @@ def create_app(manager: SessionManager) -> FastAPI:
                     if reject is not None:
                         await reject_input(reject)
                         continue
+                    # 输入框随每条消息发送其当前可见的模型 — 首次消息绑定会话（跨重连防竞争；参见 api.ts Session.userMessage），
+                    # 后续消息可能会切换模型（通知会被持久化）。
                     # The composer sends its visible model with every message — the FIRST
                     # one binds the session (race-proof across reconnects; see api.ts
                     # Session.userMessage), later ones may switch it (notice persisted).
@@ -3191,6 +3296,9 @@ def create_app(manager: SessionManager) -> FastAPI:
                     if model is not None and not isinstance(model, str):
                         await reject_input("Invalid model: expected a string.")
                         continue
+                    # 强制执行技能（SKILLS-SPEC §4.1 #3）：输入框的 `/skill` 选择作为独立字段传入。
+                    # 根据会话的有效技能菜单进行验证 — 静音或未知的技能会产生可见错误，绝非静默空操作（§4.6 #15）。
+                    # 面向模型的结构进入 `content`；转录本通过 `_display` 附加字段展示用户原始的 "/name …" 行（单个气泡）。
                     # Force-run (SKILLS-SPEC §4.1 #3): the composer's `/skill` pick rides as a
                     # separate field. Validated against the session's effective menu — a muted
                     # or unknown skill is a visible error, never a silent no-op (§4.6 #15).
@@ -3225,6 +3333,8 @@ def create_app(manager: SessionManager) -> FastAPI:
             pass
         finally:
             manager.unregister_session_client(session_id, ws.send_json)
+            # 不再有人查看此会话：内联停泊的提示会无形地等待，
+            # 因此现在立刻将其提升到收件箱（及绑定的 channel）— 而不是等到下一次引擎重建。
             # Nobody is watching this session any more: a prompt parked inline would wait
             # invisibly, so it moves to the Inbox (and a bound channel) right now — not
             # on the next engine rebuild.
@@ -3235,7 +3345,10 @@ def create_app(manager: SessionManager) -> FastAPI:
 
     @app.websocket("/ws/events")
     async def ws_events(ws: WebSocket) -> None:
-        """App-wide event stream (session-independent): the GUI keeps one open for
+        """应用级事件流（与具体会话无关）：GUI 保持一个开放连接以接收推送，
+        例如 automation_run_started（UX-026 弹出的通知）。只读 — 忽略入站帧；接收循环仅用于检测断开连接。
+
+        App-wide event stream (session-independent): the GUI keeps one open for
         pushes like automation_run_started (the UX-026 toast). Read-only — inbound
         frames are ignored; the receive loop just detects disconnect."""
         if not _websocket_authenticated(ws):
@@ -3310,7 +3423,8 @@ def create_app(manager: SessionManager) -> FastAPI:
 
 
 def _parse_json(s: str) -> dict[str, Any]:
-    """Parse a structured Inbox resolution (directory/plan carry their reply as a JSON string)."""
+    """解析结构化的收件箱解决结果（目录/计划将其回复携带为 JSON 字符串）。
+    Parse a structured Inbox resolution (directory/plan carry their reply as a JSON string)."""
     try:
         v = json.loads(s) if s else {}
         return v if isinstance(v, dict) else {}
@@ -3319,6 +3433,8 @@ def _parse_json(s: str) -> dict[str, Any]:
 
 
 def _openai_response(model: str, turn: AssistantTurn) -> dict[str, Any]:
+    """将 AssistantTurn 打包为 OpenAI 标准的 chat.completion 响应对象字典。
+    Package an AssistantTurn into a standard OpenAI chat.completion response dictionary."""
     message: dict[str, Any] = {"role": "assistant", "content": turn.text or ""}
     if turn.tool_calls:
         message["tool_calls"] = [

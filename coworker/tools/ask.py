@@ -1,4 +1,16 @@
-"""The `ask_user` tool — the agent asks the user a question and waits for the answer.
+"""[中文] `ask_user` 工具 —— 智能体向用户提问并等待回复。
+
+通用的人机协同（Human-in-the-loop）问答原语，仿照 Claude Code 的 AskUserQuestion 设计：
+包含一个问题、可选的快速回复 `options` 选项，以及（默认情况下）随时可用的自由文本输入出口 ——
+另有 `multi` 参数支持多选。与 `request_directory` 类似，它会被 TurnEngine 拦截：
+问题会转化为一个待办收件箱（Inbox）条目（可在实时会话中内联回答，或者在会话无人值守运行时从收件箱中回答），
+智能体挂起等待直至问题解决，答案作为工具结果返回。此处的调用函数仅作为 Schema 载体与安全回退实现。
+
+OPE-51 增强功能：选项可以是富对象（{label, description, recommended, preview}）而非纯字符串，
+且 `questions` 可将最多 4 个问题合并到一次调用中（前端渲染为分步向导 stepper —— 只需一次模型往返交互，
+而非多次往返）。纯字符串选项和单数形式的 `question` 仍然完全有效：旧会话和简单提问的表现与以前完全一致。
+
+The `ask_user` tool — the agent asks the user a question and waits for the answer.
 
 The general human-in-the-loop Q&A primitive, modelled on Claude Code's own AskUserQuestion: a
 question, optional quick-reply `options`, and (by default) an always-available free-text escape —
@@ -19,9 +31,14 @@ import json
 
 from aisuite.agents import ToolMetadata, tool
 
+# [中文] 单次分组调用中最多可包含的问题数量（超过此数量后分步向导标签将变得难以阅读）。
 # How many questions one grouped call may carry (stepper chips get unreadable past this).
 MAX_GROUPED_QUESTIONS = 4
 
+# [中文] 选项可以是纯字符串或富对象。`label` 是用户选择的内容（也是作为答案返回的内容）；
+# `description` 渲染在其下方；`recommended` 添加绿色推荐标签（推荐项请排在第一位）；
+# `preview` 是在侧边栏显示的等宽字体文本（代码、配置、ASCII 原型、SQL 等任意文本；
+# 当至少有一个选项具有 preview 时，卡片切换为双栏布局）。
 # An option is a plain string OR a rich object. `label` is what the user picks (and what comes
 # back as the answer); `description` renders under it; `recommended` adds the green tag (put the
 # recommended option first); `preview` is monospace text shown in the side pane (code, config,
@@ -42,6 +59,8 @@ _OPTION_SCHEMA = {
     ]
 }
 
+# [中文] 显式 Schema（模式同 todo.py）：string-or-object 选项联合类型以及嵌套的 `questions`
+# 数组无法可靠地从函数签名中自动推导。
 # Explicit schema (same pattern as todo.py): the string-or-object option union and the nested
 # `questions` array can't be auto-generated from the signature reliably.
 _ASK_SCHEMA = {
@@ -131,7 +150,17 @@ def ask_user_tool() -> object:
         header: str = "",
         questions: list | None = None,
     ) -> dict:
-        """Ask the user a question and wait for their answer — use when you genuinely need a human
+        """[中文] 向用户提问并等待回复 —— 当你真正需要人类做出决策或提供无法自行推断的信息时使用
+        （偏好设置、缺失事实、在真实备选方案之间进行抉择）。优先使用此工具，而不是随意猜测或停滞不前。
+
+        切勿用它来为即将执行的具体操作寻求许可（“我是否应该提交 PR？”）—— 请直接提议该操作：
+        批准流程会向用户展示确切的命令/参数并进行询问，这比聊天对话中的“是的”具有更强的人工确认效力。
+
+        单问题形式返回 `{"answer": "..."}` —— 所选选项的标签或输入的文本。
+        分组形式（`questions`）返回 `{"answers": {"<header or question>": "..."}}` —— 每个问题对应一个条目。
+        不要询问你可以合理自行决定的事情；将此工具留给真正需要由用户决定的选择。
+
+        Ask the user a question and wait for their answer — use when you genuinely need a human
         decision or information you can't infer (a preference, a missing fact, a choice between real
         alternatives). Prefer this over guessing or stalling.
 
@@ -144,6 +173,8 @@ def ask_user_tool() -> object:
         entry per question. Don't ask what you can reasonably decide yourself; reserve this for
         choices that are actually the user's to make.
         """
+        # [中文] 真正的处理逻辑位于引擎中（需要走带外的 Inbox 异步往返）。
+        # 这里的函数体仅在未挂接 question_asker 时运行（例如无头运行界面）。
         # Real handling lives in the engine (it needs the out-of-band Inbox round-trip). This body
         # only runs if no question_asker is wired (e.g. a headless surface).
         return {
@@ -169,7 +200,11 @@ def ask_user_tool() -> object:
 
 
 def normalize_option(opt) -> dict:
-    """One option in canonical dict form: {label, description, recommended, preview}. Plain
+    """[中文] 规范化单个选项为字典格式：{label, description, recommended, preview}。
+    纯字符串转为 {label: str, ...其余字段为空}。label 在各处（按钮、胶囊标签、问题解析）均兼作答案值，
+    因此它始终是一个非空字符串。
+
+    One option in canonical dict form: {label, description, recommended, preview}. Plain
     strings become {label: str, ...empty}. The label doubles as the answer value everywhere
     (buttons, pills, resolutions), so it is always a non-empty-able str."""
     if isinstance(opt, dict):
@@ -183,12 +218,16 @@ def normalize_option(opt) -> dict:
 
 
 def option_label(opt) -> str:
-    """The answer value / button text for a str-or-dict option."""
+    """[中文] 获取字符串或字典选项对应的答案值 / 按钮文本。
+    The answer value / button text for a str-or-dict option."""
     return str(opt.get("label", "")) if isinstance(opt, dict) else str(opt)
 
 
 def normalize_questions(raw) -> list[dict]:
-    """The grouped `questions` arg in canonical form (capped, blanks dropped). Each entry:
+    """[中文] 规范化分组 `questions` 参数为标准格式（限制数量上限，丢弃空问题）。每个条目为：
+    {question, header, options: [规范化选项], allow_text, multi}。
+
+    The grouped `questions` arg in canonical form (capped, blanks dropped). Each entry:
     {question, header, options: [canonical option], allow_text, multi}."""
     out: list[dict] = []
     for entry in list(raw or [])[:MAX_GROUPED_QUESTIONS]:
@@ -210,7 +249,11 @@ def normalize_questions(raw) -> list[dict]:
 
 
 def question_item_fields(args: dict) -> dict | None:
-    """`InboxStore.add_question` kwargs from raw ask_user args, or None when nothing was asked.
+    """[中文] 根据原始 ask_user 参数生成 `InboxStore.add_question` 的关键字参数；未提问时返回 None。
+    分组调用也会将其“第一个”问题作为 title/options 暴露出来，因此传统界面（群聊镜像、旧版持久化条目读取器）
+    可以平滑降级为合理的单问题显示。
+
+    `InboxStore.add_question` kwargs from raw ask_user args, or None when nothing was asked.
     A grouped call surfaces its FIRST question as title/options too, so legacy surfaces (channel
     mirrors, old persisted-item readers) degrade to a sensible single question."""
     grouped = normalize_questions(args.get("questions"))
@@ -229,6 +272,8 @@ def question_item_fields(args: dict) -> dict | None:
         return None
     return {
         "title": question,
+        # [中文] 字符串原样传递（简单提问保持现有的胶囊标签渲染）；
+        # 富对象进行规范化，确保下游代码绝不会遇到填充不全的字典。
         # Strings pass through untouched (simple asks keep rendering as today's pills);
         # rich objects are canonicalized so downstream never meets a half-filled dict.
         "options": [
@@ -243,7 +288,11 @@ def question_item_fields(args: dict) -> dict | None:
 
 
 def answer_result(item_questions: list, resolution: str | None) -> dict:
-    """Shape the ask_user tool result from an Inbox item's resolution string. Grouped items
+    """[中文] 根据 Inbox 条目的解决结果字符串构造 ask_user 工具的返回结果。
+    分组条目解析为以 header-or-question 为键的 JSON 字典字符串 → `{"answers": {...}}`；
+    其余情况返回简单的 `{"answer": str}` 格式。
+
+    Shape the ask_user tool result from an Inbox item's resolution string. Grouped items
     resolve with a JSON object string keyed by header-or-question → `{"answers": {...}}`;
     everything else returns the plain `{"answer": str}` shape."""
     if item_questions:
@@ -254,6 +303,7 @@ def answer_result(item_questions: list, resolution: str | None) -> dict:
         if isinstance(parsed, dict):
             return {"answers": {str(k): str(v) for k, v in parsed.items()}}
         if resolution:
+            # [中文] 来自纯文本界面（例如镜像群聊频道）的回复：将唯一的答案归因于第一个问题，避免丢失。
             # Answered from a text-only surface (e.g. a mirrored channel): attribute the lone
             # answer to the first question rather than losing it.
             first = item_questions[0] if isinstance(item_questions[0], dict) else {}

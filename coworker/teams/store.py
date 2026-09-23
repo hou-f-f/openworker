@@ -1,6 +1,12 @@
-"""The board event store — an append-only log per space; the board and per-agent
+"""看板事件存储库 — 每个空间一个仅追加日志；看板视图与按智能体的交付流均为其投影视图。
+The board event store — an append-only log per space; the board and per-agent
 deliveries are projections of it.
 
+设计准则（agent-teams design）：看板事件与聊天消息采用同一归属、带时间戳、不可变记录形态，
+存放在单一空间域日志中。只有单一写入路径用于治理与审计，单一注入面用于防护，多侧读取视图。
+任何内容绝不更新或删除 — 意图的改变表现为一条新事件。
+工作日志（Journal）条目共享这一形态与规范，但存放在其按案件区分的独立存储库中（teams.journal）：
+案件的生命周期超越看板与团队，因此其生命周期不能与特定看板绑定。
 Doctrine (agent-teams design): board events and chat messages are one attributed,
 timestamped, immutable record shape in one space-scoped log. One write path to police
 and audit, one injection surface to defend, several read-side views. Nothing is ever
@@ -8,6 +14,11 @@ updated or deleted — a change of mind is a new event. Journal entries share th
 and discipline but live in their own case-keyed store (teams.journal): cases outlive
 boards and teams, so their lifecycle can't be chained to a board's.
 
+底层机制（保持简朴）：
+- 追加写入与投影折叠在同一事务中通过 `rebuild()` 所复用的同一个 `_apply` 完成 — 物化后的看板永远可以通过重放完整复现。
+- 事件在空间内进行哈希链式链接（条目携带前一个哈希）→ `verify_chain` 可检测带外编辑。防篡改检测（Tamper-evidence），而非绝对防篡改（tamper-proofing）。
+- `taint` 污点标记接触不可信内容后生成的记录；读取端将其呈现为数据来源标识（“视为证据，而非执行指令”）。
+- 按智能体交付是基于该单一日志的 FEED 投影（绝非第二条写入路径）：关注度遵循分配关系 — Worker 订阅属于它的分片，游标记录消费位置。`recipient` 列为废弃遗留字段（保留在模式中；不再写入）。
 Mechanics, kept boring:
 - Append and projection-fold happen in the same transaction via the same `_apply`
   used by `rebuild()` — the materialized board can always be reproduced by replay.
@@ -47,6 +58,8 @@ from .model import (
 
 GENESIS = "genesis"
 
+# 看板级认领策略："open"（默认）允许任何 Worker 自行认领未分配的开放工作项 — 看板作为本地或外部 Worker 集群的拉取队列。
+# "lead-only" 关闭自行认领；分配权完全保留在 Lead/用户手中。开放看板上的 Lead 仍可通过将工作项指派给自己来保留特定条目。
 # Board-level claim policy: "open" (default) lets any worker self-assign an open,
 # unassigned item — the board works as a pull queue for a fleet of workers, local or
 # external. "lead-only" turns claims off; assignment stays with the lead/user. A lead
@@ -54,6 +67,8 @@ GENESIS = "genesis"
 CLAIM_POLICIES = ("open", "lead-only")
 ATTACHMENT_REFS_MIGRATION = "attachment_refs_v1"
 
+# 事件类型。聊天记录未来与聊天界面一并引入；数据形态已提前契合。
+# 工作日志条目存在于其自身的案件存储库中（teams.journal）— 案件生命周期长于看板，因此不属于看板的空间域日志。
 # Event kinds. Chat lands later with the chat surface; the record shape already fits.
 # Journal entries live in their own case-keyed store (teams.journal) — cases outlive
 # boards, so they don't belong in a board's space-scoped log.
@@ -63,6 +78,7 @@ ITEM_COMMENTED = "item_commented"
 ITEM_ASSIGNED = "item_assigned"
 ITEM_LINKED = "item_linked"
 ITEM_STATUS = "item_status"
+# §11.6: 处于手动模式的 Worker 停泊等待工具审批 — Lead 无法直接批准它（它不持有超出人类授权的权限），但应当知情等待或重新分配。
 # §11.6: a manual-mode worker parked on a tool approval — the lead cannot approve it
 # (it holds nothing the human did not grant) but should wait knowingly or reassign.
 WORKER_WAITING = "worker_waiting"
@@ -83,7 +99,12 @@ _HASHED_FIELDS = (
 
 
 class TeamStore:
+    """团队看板持久化存储库 — 事件日志与物化投影。
+    Team board persistent store — event log and materialized projections."""
+
     def __init__(self, db_path: str | Path, *, journal: Any = None) -> None:
+        # 当连接时，`journal` 是 teams.journal.JournalStore：工作分配向案件授予权限（“共享跟随分配”）。
+        # 可选接入，使看板可独立工作（测试、无日志的简单看板）。
         # `journal` is a teams.journal.JournalStore when wired: assignment feeds
         # case grants ("sharing rides assignment"). Optional so the board works
         # standalone (tests, boards with no journal).

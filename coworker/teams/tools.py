@@ -1,5 +1,11 @@
-"""Board and journal verbs as agent tools.
+"""看板与工作日志动词作为智能体工具。
+Board and journal verbs as agent tools.
 
+这些动词故意保持通用（连接器方言策略）：本地 TeamStore 是默认后端，
+后续 Jira/Linear 后端的方言可实现相同的工具表面。
+注册由画像的 `team:` 特征门禁 — Lead 角色获得完整工具集，Worker 角色获得 Worker 工具集，独立画像完全没有这些工具。
+
+引擎负责裁决 `taint`（该智能体在本会话中是否接触过不可信内容）并在构建时传入 — 模型绝不自报数据来源。
 The verbs are generic on purpose (the connector-dialect play): the local TeamStore is
 the default backing, and a Jira/Linear-backed dialect can implement the same tool
 surface later. Registration is gated by the persona's `team:` trait — a lead gets the
@@ -22,6 +28,9 @@ from .store import TeamStore
 
 READ_VERBS = ("get_item_comments", "get_item_comment", "get_proposal")
 LEAD_VERBS = ("create_item", "list_items", "get_item", "transition", "comment", "assign", "link") + READ_VERBS
+# Worker 也可以创建工作项（顺带发现的缺陷，后续跟进）— 新工作项以 `open` 且未分配状态落地；
+# 在分配之前不执行任何任务。`claim` 是自我认领：在开放认领的看板上（默认），Worker 可以拉取未分配的开放工作项 —
+# 存储库仲裁并发竞争，Lead 仅在异常时介入监督（每次认领均进入其 feed 流；重新分配/取消可撤销该认领）。
 # Workers file items too (a bug spotted in passing, a follow-up) — new items land
 # `open` and unassigned; nothing runs until the item is assigned. `claim` is
 # self-assignment: on an open-claims board (the default) a worker may pick up an
@@ -32,7 +41,8 @@ JOURNAL_VERBS = ("journal_append", "journal_read")
 
 
 def with_mention(item: dict) -> dict:
-    """A copyable Markdown mention; user-controlled titles cannot break out of the label."""
+    """可复制的 Markdown 引用文本；用户控制的标题无法破坏标签结构。
+    A copyable Markdown mention; user-controlled titles cannot break out of the label."""
     if "id" not in item:
         return item
     title = " ".join(str(item.get("title") or "").split())
@@ -42,12 +52,15 @@ def with_mention(item: dict) -> dict:
 
 
 def mutation_receipt(result: dict) -> dict:
-    """Keep full store/GUI projections, but never echo their history to the model."""
+    """保留完整的存储库/界面投影，但绝不向模型回显其完整历史。
+    Keep full store/GUI projections, but never echo their history to the model."""
     return {k: result[k] for k in ("error", "id", "item_id", "state", "assignee",
             "status", "status_ts", "updated_seq", "seq", "kind") if k in result}
 
 
 def item_snapshot(item: dict, *, brief: bool = False) -> dict:
+    """提取工作项状态快照字典。
+    Extract work item state snapshot dictionary."""
     if "error" in item:
         return item
     keys = ("id", "title", "state", "assignee", "status", "updated_seq", "links")
@@ -60,6 +73,8 @@ def item_snapshot(item: dict, *, brief: bool = False) -> dict:
         result.update({k: proposal[k] for k in ("activity", "workstream", "verifies") if k in proposal})
     return with_mention(result)
 
+# 显式模式：自动生成器的规范化器会剥离所有 `title` 键以丢弃 pydantic 元数据，
+# 这也会从属性中删除名为 `title` 的参数。通过 `__coworker_schema__` 注册（与 todo_write 相同的逃逸口）。
 # Explicit schema: the auto-generator's normalizer strips every `title` key to drop
 # pydantic metadata, which also deletes a PARAMETER named `title` from properties.
 # Registered via `__coworker_schema__` (same escape hatch as todo_write).
@@ -99,7 +114,12 @@ def board_tools(
     roots: Callable[[], list] = lambda: [],
     on_change: Callable[[], None] = lambda: None,
 ) -> list:
-    """The board verbs for one agent, pre-bound to its space and identity.
+    """为单个智能体预先绑定空间和身份的看板动词工具集。
+
+    权限被故意执行了两次：返回的工具集合按角色过滤（Worker 甚至根本看不到 `assign`），
+    且存储库在每次调用时重新校验 — 工具层是便利抽象，存储库才是真正的安全关口。
+
+    The board verbs for one agent, pre-bound to its space and identity.
 
     Authority is enforced twice on purpose: the returned set is role-filtered
     (a worker never even sees `assign`), and the store re-checks every call —

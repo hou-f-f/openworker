@@ -1,4 +1,17 @@
-"""Model-provider registry — descriptors + a factory, mirroring the connector
+"""[中文] 模型提供商注册表 —— 描述符 + 工厂模式，仿照连接器（`connectors/descriptors.py`）
+与网络搜索（`web/providers.py`）的设计模式。
+
+`ProviderDescriptor` 声明提供商的 UI 配置字段 `fields`（由 GUI 动态渲染，与连接器使用相同的 `to_dict()` 形状），
+以及一个返回 `ProviderClient` 的 `build(profile, secrets)` 工厂函数。
+`ProviderRouter` 根据模型字符串中的 `provider:` 前缀选择对应的描述符，并从匹配的 SecretStore 配置中构建（并缓存）其客户端。
+
+当前支持：`openai`（默认 —— 原生模型通过 Responses API 访问；可选的自定义端点涵盖 Azure OpenAI 的 `/openai/v1`
+及任何兼容 OpenAI 的网关，走 Chat Completions 路径）、`anthropic`（通过 `AnthropicProvider` 走原生 Messages API）、
+`gemini`（通过 `GeminiProvider` 走原生 Google GenAI API）、`bedrock`（用户自身 AWS 账户内的模型 —— Claude 原生接入，
+其他模型通过 Converse 接入）、`vertex`（用户自身 GCP 项目 —— Gemini 和 Claude 原生接入，开源权重模型通过 MaaS 端点接入），
+以及 `ollama`（本地，兼容 OpenAI 的 `/v1` 接口）。
+
+Model-provider registry — descriptors + a factory, mirroring the connector
 (`connectors/descriptors.py`) and web-search (`web/providers.py`) patterns.
 
 A `ProviderDescriptor` declares a provider's UI config `fields` (rendered dynamically by the
@@ -34,7 +47,8 @@ DEFAULT_OLLAMA_URL = "http://localhost:11434"
 
 @dataclass(frozen=True)
 class ProviderField:
-    """One config input for a provider, rendered by the GUI (mirrors connectors' `Field`)."""
+    """[中文] 提供商的单个配置输入字段，由 GUI 渲染呈现（仿照连接器的 `Field`）。
+    One config input for a provider, rendered by the GUI (mirrors connectors' `Field`)."""
 
     key: str
     label: str
@@ -42,15 +56,23 @@ class ProviderField:
     required: bool = True
     help: str = ""
     placeholder: str = ""
+    # [中文] 预填充（仍可编辑）的表单值 —— 例如兼容 OpenAI 的厂商官方端点，
+    # 这样用户只需粘贴 API 密钥即可。与 `placeholder`（灰色提示）不同。
     # Pre-filled (still editable) form value — e.g. an OpenAI-compatible vendor's official
     # endpoint, so the user only has to paste a key. Distinct from `placeholder` (grey hint).
     default: str = ""
+    # [中文] 非空 → 该字段渲染为分段单选控件而非文本输入框；
+    # 每个选项为 {"value", "label"} 加上可选的 UI 扩展项："tag"（微型角标，如 "Easiest"）、
+    # "desc"（方法面板顶部的一句话描述），以及 "command"（面板中展示的可复制终端命令，如 gcloud ADC 登录）。
+    # 选中的值与其他字段值一样保存存储。
     # Non-empty → the field renders as a segmented choice control instead of a text input;
     # each option is {"value", "label"} plus optional UI extras: "tag" (a tiny badge like
     # "Easiest"), "desc" (one-liner atop the method's panel), and "command" (a copyable
     # terminal command shown in the panel, e.g. the gcloud ADC login). The chosen value is
     # stored like any other field value.
     choices: tuple = ()
+    # [中文] {"other_field_key": "value"} → 仅当另一个字段为该值时，当前字段才渲染。
+    # 用于驱动认证方式切换（如 Bedrock），无需针对每个提供商单独定制表单。
     # {"other_field_key": "value"} → the field only renders while that other field holds
     # that value. Drives auth-method switching (Bedrock) without a per-provider form.
     show_when: Optional[dict] = None
@@ -71,7 +93,8 @@ class ProviderField:
 
 @dataclass(frozen=True)
 class ProviderDescriptor:
-    """A model provider: its UI fields + a factory that builds its `ProviderClient`."""
+    """[中文] 模型提供商描述符：其 UI 字段 + 构建其 `ProviderClient` 的工厂函数。
+    A model provider: its UI fields + a factory that builds its `ProviderClient`."""
 
     name: str
     title: str
@@ -79,13 +102,17 @@ class ProviderDescriptor:
     fields: list[ProviderField]
     build: Callable[[dict[str, Any], Any], ProviderClient] = field(repr=False)
     recommended_model: Optional[str] = (
-        None  # pre-filled in the UI; auto-added on configure
+        None  # [中文] UI 中预填充的模型；配置时自动添加 / pre-filled in the UI; auto-added on configure
     )
     env_key: Optional[str] = (
-        None  # env var that can supply the API key (e.g. ANTHROPIC_API_KEY)
+        None  # [中文] 可提供 API 密钥的环境变量（如 ANTHROPIC_API_KEY） / env var that can supply the API key (e.g. ANTHROPIC_API_KEY)
     )
+    # [中文] 提供商标天下方的一句话说明（例如“通过 X 的 OpenAI 兼容 API 连接”）。
     # One-line note under the provider title (e.g. "Connects through X's OpenAI-compatible API").
     blurb: str = ""
+    # [中文] "oauth" → 完全不需要 API 密钥表单：提供商通过浏览器登录进行配置
+    # （令牌保存在其 `provider:<name>` 配置文件中），GUI 渲染“连接/退出”按钮而非输入字段。
+    # None → 常规的密钥/字段表单。
     # "oauth" → no key form at all: the provider is configured by a browser sign-in
     # (tokens in its `provider:<name>` profile) and the GUI renders connect/sign-out
     # instead of fields. None → the usual key/field form.
@@ -104,7 +131,11 @@ class ProviderDescriptor:
 
 
 def _normalize_ollama_url(url: Optional[str]) -> str:
-    """Accept `http://host:11434` or `.../v1` and return an OpenAI-compatible base URL.
+    """[中文] 接收 `http://host:11434` 或 `.../v1` 并返回兼容 OpenAI 的根路径 URL。
+
+    Ollama 在 `/v1` 下提供其兼容 OpenAI 的 API；原生 API 位于根目录，因此我们始终将目标对准 `<root>/v1`。
+
+    Accept `http://host:11434` or `.../v1` and return an OpenAI-compatible base URL.
 
     Ollama serves its OpenAI-compatible API under `/v1`; the native API lives at the root, so we
     always target `<root>/v1`.
@@ -118,6 +149,10 @@ def _normalize_ollama_url(url: Optional[str]) -> str:
 
 
 def _build_openai(profile: dict[str, Any], secrets: Any) -> ProviderClient:
+    # [中文] 密钥解析依然在 resolve_api_key 中进行（显式指定 → 环境变量 → SecretStore），
+    # 因此我们只需转交 SecretStore。原生 OpenAI（无自定义端点）走 Responses API ——
+    # 这是 GPT-5.6+ 上同时支持思考与工具调用的唯一连线方式。自定义端点（Azure OpenAI /openai/v1、
+    # vLLM、任何兼容 OpenAI 的网关）保留 Chat Completions 路径，这也是兼容服务器所实现的协议。
     # Key resolution stays in resolve_api_key (explicit → env → SecretStore), so we just
     # hand over the SecretStore. Stock OpenAI (no custom endpoint) speaks the Responses
     # API — the only wire with reasoning + tools on GPT-5.6+. A custom endpoint (Azure
@@ -130,6 +165,7 @@ def _build_openai(profile: dict[str, Any], secrets: Any) -> ProviderClient:
 
 
 def _build_codex(profile: dict[str, Any], secrets: Any) -> ProviderClient:
+    # [中文] 凭证来自提供商自身配置文件中设置的 OAuth 令牌，在调用时由令牌存储器解析（并刷新）—— 绝不使用 API 密钥。
     # Credentials come from the OAuth token set in the provider's own profile,
     # resolved (and refreshed) at call time by the token store — never a key.
     from .codex_provider import CodexProvider
@@ -138,6 +174,9 @@ def _build_codex(profile: dict[str, Any], secrets: Any) -> ProviderClient:
 
 
 def _build_anthropic(profile: dict[str, Any], secrets: Any) -> ProviderClient:
+    # [中文] 密钥解析依然在 AnthropicProvider/resolve_api_key 中进行（显式指定 → 环境变量 → SecretStore），
+    # 延迟到首次调用时触发，以便在密钥存在之前即可完成提供商的构建。
+    # thinking_budget：隐藏的配置文件覆盖项 —— 缺失/无效 → 默认值（开启），显式设置为 0 → 关闭（参见 DEFAULT_THINKING_BUDGET）。
     # Key resolution stays in AnthropicProvider/resolve_api_key (explicit → env → SecretStore),
     # deferred to first call so the provider can be built before a key exists.
     # thinking_budget: hidden profile override — absent/invalid → the default (ON),
@@ -155,12 +194,14 @@ def _build_anthropic(profile: dict[str, Any], secrets: Any) -> ProviderClient:
 
 
 def _build_gemini(profile: dict[str, Any], secrets: Any) -> ProviderClient:
+    # [中文] 与 anthropic 相同的延迟密钥契约（GeminiProvider/resolve_api_key）。
     # Same deferred-key contract as anthropic (GeminiProvider/resolve_api_key).
     api_key = ((profile or {}).get("api_key") or "").strip() or None
     return GeminiProvider(api_key=api_key, secrets=secrets)
 
 
 def _build_bedrock(profile: dict[str, Any], secrets: Any) -> ProviderClient:
+    # [中文] 凭证在调用时由 boto3/AnthropicBedrock 内部解析：显式密钥 → 指定 profile → 环境链（环境变量 / ~/.aws 默认配置 / 实例角色）。
     # Credentials resolve inside boto3/AnthropicBedrock at call time: explicit keys →
     # named profile → ambient chain (env / ~/.aws default / instance role).
     p = profile or {}
@@ -195,6 +236,7 @@ def _build_vertex(profile: dict[str, Any], secrets: Any) -> ProviderClient:
 
 
 def _build_ollama(profile: dict[str, Any], secrets: Any) -> ProviderClient:
+    # [中文] Ollama 的 OpenAI 兼容端点会忽略密钥，但 SDK 要求非空字符串，因此我们传入占位符。`base_url` 来自存储的 profile（或默认值）。
     # Ollama's OpenAI-compatible endpoint ignores the key but the SDK requires a non-empty
     # string, so we pass a placeholder. `base_url` comes from the stored profile (or the default).
     base_url = _normalize_ollama_url((profile or {}).get("base_url"))
@@ -202,7 +244,11 @@ def _build_ollama(profile: dict[str, Any], secrets: Any) -> ProviderClient:
 
 
 def _openai_compat(vendor: str, default_base_url: str, env_key: Optional[str] = None):
-    """Builder factory for vendors reached through their OpenAI-compatible API (Z AI, DeepSeek,
+    """[中文] 通过 OpenAI 兼容 API 接入的厂商构建工厂（Z AI、DeepSeek、Kimi、MiniMax、Qwen、xAI、Mistral 等）。
+    密钥从厂商自身的 profile（或其环境变量）中解析 —— 刻意不回退到 OpenAI 的环境变量/SecretStore，
+    以避免将配置的 OpenAI 密钥静默发送到其他厂商的端点。缺少密钥 ⇒ 立即报错并指出厂商名称（仅当选择其模型时按需构建）。
+
+    Builder factory for vendors reached through their OpenAI-compatible API (Z AI, DeepSeek,
     Kimi, MiniMax, Qwen, xAI, Mistral). The key is resolved from the vendor's OWN profile (or its
     env var) — deliberately NOT from the OpenAI env/SecretStore fallback, so a configured OpenAI
     key is never silently sent to a different vendor's endpoint. Missing key ⇒ fail fast with a
@@ -230,12 +276,16 @@ def _openai_responses_compat(
     *,
     reasoning_summary: bool = True,
 ):
-    """Builder factory for vendors that explicitly implement the OpenAI Responses API.
+    """[中文] 针对显式实现 OpenAI Responses API 的厂商构建工厂。
+
+    凭证保持隔离在厂商自身的 profile/环境变量中，与上方的 Chat Completions 兼容路径一致。
+    特别是，OpenAI 密钥绝不会发送到火山引擎（Ark）。
+
+    Builder factory for vendors that explicitly implement the OpenAI Responses API.
 
     Credentials stay isolated to the vendor's own profile/environment variable, matching the
     Chat Completions compat path above. In particular, an OpenAI key is never sent to Ark.
     """
-
     def build(profile: dict[str, Any], secrets: Any) -> ProviderClient:
         base_url = ((profile or {}).get("base_url") or "").strip() or default_base_url
         api_key = ((profile or {}).get("api_key") or "").strip() or (

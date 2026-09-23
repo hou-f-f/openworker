@@ -1,4 +1,13 @@
-"""ConversationStore — global, file-backed session storage shared by all surfaces.
+"""[中文] ConversationStore —— 所有前端界面共享的全局文件持久化会话存储。
+
+基础目录下的布局（默认 `~/.config/coworker/`）：
+  coworker.db                  SQLite 索引：sessions(id → 项目路径, 标题, 消息数), workspaces, memory
+  conversations/<id>.jsonl     仅追加消息日志，每个会话一个文件
+
+每次写入仅追加每轮的新消息（不重写历史记录）。
+以往将消息内联保存在数据库行中的旧数据会在首次加载/保存时惰性迁移到 .jsonl 文件中。
+
+ConversationStore — global, file-backed session storage shared by all surfaces.
 
 Layout under a base dir (default `~/.config/coworker/`):
   coworker.db                  SQLite index: sessions(id → project, title, n_msgs), workspaces, memory
@@ -20,6 +29,11 @@ from typing import Optional
 
 from .sessions import SessionRecord
 
+# [中文] 会话 ID 会作为文件名（`<id>.jsonl`）和临时目录名使用，因此必须是单个良性的路径组成部分。
+# 每一个合法的 ID 都是十六进制字符串或带有 `__run__`/`__task__` 前缀的十六进制字符串，因此该字符集
+# 是我们生成的 ID 的超集；它排除了客户端提供的 ID 逃逸出存储目录所需的路径分隔符和点号（`/`、`\`、`..`）。
+# 会话 ID 来自客户端控制的接口（`/ws/session/{id}` 路由、REST 路径），
+# 如果不加校验，像 `../../evil` 这样的 ID 就会在 `conversations/` 之外写入 `<base>/evil.jsonl`。
 # A session id becomes a filename (`<id>.jsonl`) and a scratch dir name, so it must be a
 # single, benign path component. Every legitimate id is hex or a `__run__`/`__task__`-
 # prefixed hex string, so this charset is a superset of what we generate; it excludes the
@@ -55,7 +69,10 @@ def _load_grants(raw: Optional[str]) -> dict:
 
 
 def _display_title(row: sqlite3.Row) -> Optional[str]:
-    """Title precedence for every read path: a manual rename (renamed=1) always wins,
+    """[中文] 所有读取路径的标题优先级：手动重命名（renamed=1）始终最高，
+    其次是生成的自动标题 auto_title，最后是 `save()` 写入的首行快照。
+
+    Title precedence for every read path: a manual rename (renamed=1) always wins,
     then the generated auto_title, then the first-line snapshot `save()` wrote."""
     if row["renamed"]:
         return row["title"]
@@ -125,6 +142,8 @@ class ConversationStore:
 
     # -- file helpers -----------------------------------------------------------
     def _file(self, sid: str) -> Path:
+        # [中文] 每一个会话文件路径的单一关卡。拒绝不是安全路径组件的 ID，
+        # 然后确认解析后的路径依然位于 conv_dir 内部 —— 从而使特意构造的 ID 绝无法读取或破坏存储区外的文件。
         # Single chokepoint for every conversation-file path. Reject ids that aren't a
         # safe path component, then confirm the resolved path stays inside conv_dir — so
         # a crafted id can never read or clobber a file outside the store.
@@ -139,6 +158,11 @@ class ConversationStore:
         path = self._file(sid)
         if not path.exists():
             return None
+        # [中文] 宽容对待损坏/截断的行，而不是让整个加载过程崩溃。
+        # 在写入中途被中断的追加操作（崩溃、磁盘已满）会留下一个畸形的末尾行；
+        # 在列表推导式中直接使用 `json.loads` 会抛出 JSONDecodeError，导致之后的每一次 load()
+        # 都报错 —— 从而使打开该会话的任何界面都彻底卡死。
+        # 跳过损坏的行，尽可能保留可恢复的历史记录。（该模块中的所有其他 JSON 读取均已具备容错性；此处曾是例外情况。）
         # Tolerate a corrupt/truncated line rather than failing the whole load. An append
         # interrupted mid-write (crash, disk full) leaves one malformed trailing line; a
         # bare `json.loads` in a comprehension would raise JSONDecodeError and make load()
@@ -158,7 +182,20 @@ class ConversationStore:
     # -- tool-call/result pairing repair ---------------------------------------
     @staticmethod
     def _repair_tool_pairing(messages: list[dict]) -> list[dict]:
-        """Reorder messages so every tool result immediately follows its call.
+        """[中文] 重新排列消息顺序，确保每个工具调用结果紧跟在其调用之后。
+
+        仅追加持久化意味着被中断的轮次可能会在助手的 ``tool_calls`` 块与匹配的 ``tool`` 结果之间夹带一条用户消息。
+        各大模型服务商会拒绝这种顺序（Anthropic 报 400/2013，OpenAI 报 "tool_call_ids did not have response messages"），
+        导致该会话永久无法恢复。
+
+        本处理流程：
+        * 将在对话流后面找到的真实 ``tool`` 结果移到其对应调用之后。
+        * 对于没有匹配工具消息的调用合成占位结果 —— 但 **仅当** 对话流已经推进到了该调用之后
+          （即在助手块之后还有消息存在）。末尾没有结果的助手 ``tool_calls`` 是待处理/被中断的调用，
+          引擎稍后会恢复执行；在此处注入占位符会破坏持久化恢复。
+        * 具备幂等性 —— 格式良好的对话流原样通过，不做改动。
+
+        Reorder messages so every tool result immediately follows its call.
 
         Append-only persistence means an interrupted turn can leave a user
         message between an assistant ``tool_calls`` block and the matching
@@ -277,7 +314,10 @@ class ConversationStore:
                 f.write(json.dumps(m) + "\n")
 
     def _backfill_counts(self) -> None:
-        """One-time per session: move any inline blob into a .jsonl and persist
+        """[中文] 每个会话执行一次：将内联 blob 迁移到 .jsonl 文件中，并在索引中持久化标题与消息数 n_msgs。
+        后续启动时跳过已经迁移的行。
+
+        One-time per session: move any inline blob into a .jsonl and persist
         title + n_msgs in the index. Skips already-migrated rows on later startups."""
         with self._lock:
             rows = self._conn.execute(
@@ -311,12 +351,15 @@ class ConversationStore:
 
     # -- API --------------------------------------------------------------------
     def save(self, record: SessionRecord, touch: bool = True) -> None:
+        # [中文] touch=False：内部簿记写入（持久化通知迁移、未伴随活动的状态标记）——
+        # 更新该行但保持其在“最近使用”中的位置不变。
+        # `updated_at` 表示“最后处理时间”，绝不代表“最后保存时间”（所有者裁决 2026-08-24）。
         # touch=False: a BOOKKEEPING write (persisted notice migration, mode marker with
         # no accompanying activity) — the row updates but keeps its place in Recents.
         # `updated_at` means "last worked on", never "last saved" (owner ruling 2026-08-24).
         sid = record.session_id
         with self._lock:
-            # lazily migrate a legacy inline blob into the .jsonl
+            # [中文] 惰性将旧版的内联 blob 迁移到 .jsonl 中 / lazily migrate a legacy inline blob into the .jsonl
             if not self._file(sid).exists():
                 row = self._conn.execute(
                     "SELECT messages FROM sessions WHERE session_id = ?", (sid,)
@@ -332,7 +375,10 @@ class ConversationStore:
             existing = self._count(sid)
             if len(record.messages) > existing:
                 self._append(sid, record.messages[existing:])
-            elif len(record.messages) < existing:  # rare; not append-only
+            elif len(record.messages) < existing:  # [中文] 罕见情况；非仅追加模式 / rare; not append-only
+                # [中文] 原子重写：将完整日志写入临时文件，然后一步替换到位。
+                # 直接使用 open(..., "w") 会立刻截断清空文件，若在重写中途发生崩溃将导致会话历史丢失
+                # （采用与 subscriptions.ChannelBuffer._save 相同的临时文件替换模式）。
                 # Atomic rewrite: write the full log to a temp file, then replace in one
                 # step. An in-place open(..., "w") truncates the file immediately, so a
                 # crash mid-rewrite would erase the conversation history (same

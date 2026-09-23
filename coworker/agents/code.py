@@ -1,11 +1,14 @@
-"""The Code agent — the coding surface (files, search, git, persistent shell, todo)."""
+"""[中文] Code Agent（编码智能体）—— 编码交互界面（文件、搜索、Git、持久 Shell、待办清单）。
+[English] The Code agent — the coding surface (files, search, git, persistent shell, todo).
+"""
 
 from __future__ import annotations
 
 from ..catalog import expand
 from .base import Agent
 
-# Capabilities this surface composes from the vetted catalog (was a hand-written factory).
+# [中文] 该界面从经审查的目录组合的能力（文件、git、搜索、shell、待办清单）。
+# [English] Capabilities this surface composes from the vetted catalog (was a hand-written factory).
 CODE_CAPABILITIES = ["code_files", "git", "search", "shell", "todo"]
 
 CODE_INSTRUCTIONS = """You are coworker's coding agent — a careful, senior software engineer working in the user's \
@@ -64,6 +67,8 @@ the request is ambiguous rather than guessing."""
 
 
 def code_agent() -> Agent:
+    """[中文] 构建 Code 智能体实例（需要选定文件夹作为主工作区，支持探索子智能体）。
+    [English] Build the Code agent instance (requires a selected folder as primary workspace, supports subagents)."""
     return Agent(
         name="code",
         title="Code",

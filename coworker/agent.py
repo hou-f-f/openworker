@@ -1,4 +1,9 @@
-"""Engine assembly from an Agent (Code / Chat / …).
+"""[中文] 从 Agent（智能体角色，例如 Code / Chat / …）组装 TurnEngine 执行引擎。
+
+将智能体的基础工具 + 权限控制 + AGENTS.md（工作区智能体规范）+ 长期记忆 +
+技能目录（渐进式展示）+ load_skill 工具组装为一个完整的 TurnEngine 实例。
+
+Engine assembly from an Agent (Code / Chat / …).
 
 Wires the agent's base tools + permissions + AGENTS.md (workspace agents) + memory +
 the skill catalog (progressive disclosure) + load_skill into a TurnEngine.
@@ -51,6 +56,8 @@ from .workspace_trust import WorkspaceTrustStore
 from .tools.shell import LocalExecutor
 from .tools.todo import TodoList
 
+# [中文] 当 discuss（讨论）模式处于激活状态时，在每个轮次追加的提示：
+# 仅执行只读限制，不施加制定计划的压力（这正是它与 plan 计划模式的区别）。
 # Appended each turn while discuss mode is active: enforcement-only read-only, with no
 # pressure toward a plan proposal (that's what distinguishes it from plan mode).
 _DISCUSS_MODE_CONTEXT = """\
@@ -58,6 +65,8 @@ Discuss mode is active: write and shell tools are disabled. Explore and answer f
 the user asks for a change, describe it in chat instead of attempting it (they can switch
 to plan or approval mode to have you make it)."""
 
+# [中文] 当 plan（计划）模式处于激活状态时，在每个轮次追加到最新用户消息的提示。
+# 模式可能在会话中途发生切换（计划获批时），因此不能写死在静态指令中。
 # Appended to the latest user message every turn while plan mode is active. The mode can
 # flip mid-session (plan approval), so this can't live in the static instructions.
 _PLAN_MODE_CONTEXT = """\
@@ -67,6 +76,9 @@ in which files, how you'll verify) — don't describe edits as if you were makin
 the plan is approved, this same session switches to execution and you implement it; if
 rejected, revise the plan using the feedback."""
 
+# [中文] 何时记录长期记忆的准则 (MEMORY-SPEC §4.2)，仅在连接了记忆存储时注入。
+# 若无这些规则，大模型要么从不调用 `remember`，要么记录代码仓库已具备的无用噪声。
+# 偏向保守是有意为之：一条错误的记忆会让人感到系统损坏和诡异，而缺失记忆仅意味着用户需要重复一次。
 # When-to-remember rules (MEMORY-SPEC §4.2), injected only when a memory store is wired.
 # Without these, models either never call `remember` or save noise the repo already
 # records. The conservative bias is deliberate: a wrong memory feels broken and creepy at
@@ -96,6 +108,10 @@ entries with `memory_forget`.
 - Memories reflect when they were written. If one names a file, flag, or URL, verify it \
 still exists before relying on it."""
 
+# [中文] 当用户在设置中关闭记忆功能时注入以*替代*记忆准则 (§4.3)。
+# 关闭意味着“停止学习”，而非“遗忘既有知识”：已保存的记忆仍会被注入并可正常使用，仅仅是写入工具被移除。
+# 若无此通知，模型会自吹自擂 —— 在被要求“记住”却无 remember 工具时，它会通过待办清单虚构保存过程（“我会记住你最喜欢的颜色是蓝色”）。
+# 诚实要求模型必须知晓保存已关闭，而不仅仅是缺少工具。
 # Injected INSTEAD of the memory guidance when the user turned memory off (§4.3).
 # Off means "stop LEARNING", not "forget what you know": already-saved memories stay
 # injected and usable; only the write tools are gone. Without this notice the model
@@ -111,6 +127,8 @@ new, state both halves plainly: you'll keep it in mind for the rest of this conv
 but it won't be saved once the conversation ends — they can turn saving back on in \
 Settings ▸ Memory. Never imply you saved, noted, or will remember anything new."""
 
+# [中文] UX-015 (§33)：图形界面在折叠的“轮次”中将这些状态行与人性化的工具执行行穿插显示 —— 它们是用户在智能体工作时看到的内容。
+# 通用规则（为每个角色附加）；忽略它的模型会平稳降级为无旁白解释的轮次。
 # UX-015 (§33): the GUI interleaves these status lines with humanized tool rows inside a
 # collapsed "turn" — they're what the user reads while the agent works. Universal (appended
 # for every persona); models that ignore it degrade gracefully to a turn with no narration.
@@ -120,6 +138,8 @@ you're doing and why (e.g. "Checking what merged since yesterday's digest."). It
 to the user as live progress. Don't narrate trivial single-call follow-ups, don't repeat \
 the previous line, and never let narration replace your final answer."""
 
+# [中文] 一句单薄的“hey”用一句单薄的“hey”来答复会使专家角色看起来像个空聊天框（所有者发现 2026-08-24）。
+# 首次接触是展现该工作助手用途的唯一时刻 —— 此后，问候语保持简短轻量。
 # A bare "hey" answered with a bare "hey" makes a specialist read as an empty chat box
 # (owner catch 2026-08-24). First contact is the one moment to show what this coworker
 # is for — after that, greetings stay lightweight.
@@ -139,7 +159,8 @@ CHAT_PLATFORMS: frozenset[str] = frozenset({"slack", "telegram"})
 def _chat_platforms(
     agent: Agent, secrets: SecretStore, connector_filter: Optional[set[str]] = None
 ) -> set[str]:
-    """The chat platforms this session may post to: gateway-enabled (token or relay
+    """[中文] 本会话允许发送消息的聊天平台集合：网关已启用（存在 token 或中继）∩ 角色的 `connectors:` 白名单 ∩ 会话的有效集合。
+    The chat platforms this session may post to: gateway-enabled (token or relay
     present) ∩ the persona's `connectors:` allowlist ∩ the session's effective set."""
     if not agent.connectors:
         return set()
@@ -169,7 +190,10 @@ def _enabled_connector_tools(secrets: SecretStore) -> tuple[set[str], set[str]]:
 
 
 def _loaded_skill_names(messages: list[dict[str, Any]]) -> set[str]:
-    """Skills whose instructions successfully entered THIS conversation (a load_skill call
+    """[中文] 技能指令已成功进入“当前对话”的技能集合（调用 load_skill 且返回非错误结果）。
+    用于驱动禁用撤销命令：菜单静默缩小属于被动行为，但历史记录中已存在的指令会持续引导大模型，除非明确要求其停止。
+
+    Skills whose instructions successfully entered THIS conversation (a load_skill call
     with a non-error result). Drives the disable countermand: a menu quietly shrinking is
     passive, but instructions already in history keep steering the model unless it is
     explicitly asked to stop."""
@@ -292,6 +316,8 @@ def build_engine(
     if agent.requires_folder and ws is None:
         raise ValueError(f"agent '{agent.name}' requires a workspace")
 
+    # [中文] 会话的目录集合。显式 `roots`（无依托 Cowork：草稿区 + 添加的文件夹）优先；
+    # 否则单个工作区作为唯一可写根目录。单一共享的可变列表传递给文件工具、权限引擎及上下文注入器，以便所有组件都能感知增删变更。
     # The session's directories. Explicit `roots` (orphan Cowork: scratch + added folders) wins;
     # otherwise the single workspace is the sole writable root. One shared, mutable list flows to
     # the file tools, the permission engine, and the context injector so add/remove is seen by all.
@@ -302,6 +328,9 @@ def build_engine(
     else:
         root_list = []
 
+    # [中文] OPE-186：截断后的工具结果将其完整文本保存在溢出文件（spill file）中供模型读取，历史压缩记录也写在此处。
+    # 优先使用会话的 scratch 草稿根目录（已属于智能体的文件夹之一）。否则在构建工具之前以只读形式加入会话目录列表，以便 read_file 可以读取它。
+    # 绝不写入工作区自身，确保代码仓库或任务目录保持整洁。
     # OPE-186: bounded tool results keep their full text in a spill file the model can
     # read, and the compaction transcript is written there too. Prefer the session's
     # scratch root (already one of the agent's folders). Otherwise the folder joins the
@@ -347,6 +376,10 @@ def build_engine(
     # MCP / connector tools (supplied by the manager) carry their own metadata + schema.
     if extra_tools:
         registry.register_all(extra_tools)
+    # [中文] 聊天工具遵从连接器门控（规范 §11，2026-09-05）：若会话的有效连接器集包含聊天平台，
+    # 则获得通用回复工具对（send_message / send_file）以及订阅工具。
+    # 旧的 `messaging` 特性不再起决定作用 —— “已启用 Slack” 即为充分条件；
+    # 平台自身的目录工具通过下方的 make_integration_tools 引入。
     # Chat tools follow the connector gate (spec §11, 2026-09-05): a session whose
     # effective connector set includes a chat platform gets the generic reply pair
     # (send_message / send_file, kept until §11.7 step 7) and the subscription tools.
@@ -356,11 +389,13 @@ def build_engine(
     secrets = secrets or SecretStore()
     if _chat_platforms(agent, secrets, connector_filter):
         registry.register(make_send_message_tool(secrets))
+        # [中文] send_file (§34)：将交付物发送到聊天中 —— 目标相同，但拥有自己独立的审批界面（话题的常规 send_message 授权绝不涵盖文件上传）。
         # send_file (§34): hand deliverables into the chat — same targets, but its OWN
         # approval surface (a thread's standing send_message grant never covers uploads).
         registry.register(
             make_send_file_tool(secrets, workspace=ws, roots=root_list or None)
         )
+        # [中文] 频道订阅（入站）：监听频道、追赶历史、订阅/取消订阅。智能体通过 ask_user 或所响应的频道消息获取频道。
         # Channel subscriptions (inbound): listen to a channel, catch up, (un)subscribe. The agent
         # obtains a channel via ask_user or from a channel message it's reacting to.
         if subscription_store is not None and channel_buffer is not None and session_id:
@@ -374,21 +409,26 @@ def build_engine(
                     release=subscription_release,
                 )
             )
+    # [中文] 具备多根目录工作区的界面可以在任务中途向用户请求挂载另一个文件夹。
     # Surfaces with a multi-root workspace can ask the user mid-task for another folder.
     if root_list:
         registry.register(request_directory_tool())
+    # [中文] 拥有 shell 执行权限的智能体可能会遇到缺失的 CLI 工具（扫描器、aws、kubectl 等）。为其提供一种主动请求安装的方式，而非静默放弃需要它的检查 (OPE-85)。
     # Anything with a shell can hit a missing CLI (a scanner, aws, kubectl). Give it a way to
     # ask instead of silently dropping the check that needed it (OPE-85).
     if executor is not None:
         registry.register(request_tool_tool())
     if agent.connectors:
         enabled_connectors, enabled_tools = _enabled_connector_tools(secrets)
+        # [中文] 最小权限原则授予 (OPE-93)：声明了白名单的角色仅获得其声明的连接器 —— 未声明连接器的工具绝不会进入会话，无论用户连接了多少服务。
+        # True = 通用角色（如 Cowork 协作助手），合法使用所有已连接的服务。
         # Least-privilege grant (OPE-93): a persona with an allowlist gets ONLY the
         # connectors it declared — an undeclared connector's tools never enter the
         # session, no matter what the user has connected. True = general personas
         # (Cowork) that legitimately drive whatever is connected.
         if agent.connectors is not True:
             enabled_connectors = enabled_connectors & set(agent.connectors)
+        # [中文] 会话级连接层级 (UI-REFRESH §4.3)：当调用方提供会话的有效连接器集时，取交集使得只有有效启用的连接器暴露工具。
         # Per-session connection hierarchy (UI-REFRESH §4.3): when the caller supplies the session's
         # effective connector set, intersect it so only effective-enabled connectors expose tools.
         # Default None preserves CLI / direct callers (no per-session restriction).
@@ -402,16 +442,20 @@ def build_engine(
                 roots=root_list or None,
             )
         )
+    # [中文] 网络搜索与抓取：为每个智能体提供的调研工具（默认使用免密钥的 DuckDuckGo）。
     # Web search + fetch: research tools for every agent (keyless DuckDuckGo default).
     registry.register(make_web_search_tool(secrets))
     registry.register(make_web_fetch_tool())
+    # [中文] ask_user：通用的人机协同问答原语（所有智能体均可使用；由引擎拦截处理）。
     # ask_user: the universal human-in-the-loop Q&A primitive (every agent; engine-intercepted).
     if question_asker is not None:
         registry.register(ask_user_tool())
+    # [中文] 按模型的 `provider:` 前缀进行路由（默认 OpenAI，支持 Ollama 等）。
     # Route by the model's `provider:` prefix (OpenAI default, Ollama, …). The manager normally
     # passes its shared router; this fallback covers the TUI / direct build_engine() callers.
     # Resolved here (not at engine construction) because the explorer subagent captures it.
     provider = provider or ProviderRouter(secrets, default_provider="openai")
+    # [中文] 针对代码仓库的角色可以将广泛的调研任务分派给只读的 explorer（探索者）子智能体，自身保留宝贵的上下文用于实际变更。
     # Repo-focused personas can fan broad research out to read-only explorer subagents, keeping
     # their own context for the actual change.
     if agent.subagents and ws is not None:
@@ -423,6 +467,7 @@ def build_engine(
                 model_settings=model_settings,
             )
         )
+    # [中文] 定时任务：拥有工作区且选择启用的界面可以设置计划任务（源头 = 当前会话）。
     # Scheduling: opted-in surfaces with a workspace can set up scheduled tasks (origin = this
     # session). Code stays out (it fans out to explorers instead).
     if task_store is not None and ws is not None and agent.scheduling:
@@ -435,10 +480,13 @@ def build_engine(
         registry.register_all(
             scheduling_tools(task_store, origin=origin, default_workspace=str(ws))
         )
+    # [中文] 自动唤醒：具备调度能力的界面可以暂停并预约自身的恢复（基于定时器 / 任务完成 / 特定事件）。
     # Self-wake: scheduling surfaces can suspend + schedule their own resumption (timer /
     # on-completion / on-event). The scheduler tick resumes due wakes.
     if wake_store is not None and session_id and (agent.scheduling or agent.team == "lead"):
         registry.register_all(selfwake_tools(wake_store, session_id))
+    # [中文] 时钟按需提供给所有界面：系统提示词中的“今日日期”只是会话启动时的快照，
+    # 而每轮上下文块绝不能携带动态时间（见下方的 context_provider）。截止时间、计算“多久之前”以及 sleep_until 的唤醒时间均来源于此。
     # The clock, on demand, for every surface: the system prompt's "Today's date" is a
     # session-start snapshot, and the per-turn context block must not carry a live time
     # (see context_provider below). Deadlines, "how long ago", and the wake time for
@@ -499,6 +547,8 @@ def build_engine(
         return not memory_off
 
     if memory_store is not None:
+        # [中文] 始终提供完整工具集：注册表在构建时即已固定，因此在保存功能关闭期间创建的会话在开启后必须能立即保存。
+        # 强制执行由工具自身的实时检查完成，而非通过工具缺失来实现。
         # Always the full toolset: the registry is fixed at build, so a session born
         # while saving was off must still be able to save the moment it's turned on.
         # Enforcement is the tools' own live check, not their absence.
@@ -512,6 +562,8 @@ def build_engine(
             )
         )
         instructions = f"{instructions}\n\n{_MEMORY_GUIDANCE}"
+        # [中文] 工作助手所知晓的记忆在会话启动时固定 (MEMORY-SPEC §7.1)：会话的知识不应中途漂移 —— 十轮前提及的事实不能无故消失；
+        # 且系统提示词是缓存前缀，事实只需处理一次而无需每轮重发。删除操作对新会话生效。
         # What the coworker KNOWS is fixed at session start (MEMORY-SPEC §7.1): a
         # conversation's knowledge must not shift underfoot — a fact it referenced ten
         # turns ago cannot silently vanish — and the system prompt is the cached prefix,
@@ -524,9 +576,12 @@ def build_engine(
         if block:
             instructions = f"{instructions}\n\n{block}"
 
+    # [中文] 角色目录排在最前，使得用户同名的全局/工作区技能能覆盖角色包自带的技能（加载器中后列出的目录覆盖先列出的）。
     # Persona dirs come FIRST so a user's global/workspace copy of the same name shadows
     # the bundle's (later dirs overwrite earlier in the loader).
     skill_loader = SkillLoader([Path(d) for d in (extra_skill_dirs or [])] + _skill_dirs(ws))
+    # [中文] 会话有效技能菜单 (SKILLS-SPEC §3)。管理器传入可调用对象以便 load_skill 每次调用时检查最新状态。
+    # 技能目录本身通过 context_provider 在每轮动态注入，而非在此处写死 —— 因此模型看到的菜单也是实时的。
     # Per-session effective menu (SKILLS-SPEC §3). The manager passes a CALLABLE so
     # load_skill consults the LIVE state per call (a Settings disable applies to running
     # sessions; a skill created after this build is still loadable). The catalog itself
@@ -534,6 +589,7 @@ def build_engine(
     # sees is also live: skill changes apply from the next message, no new session needed.
     # Default None preserves CLI / direct callers.
     registry.register_all(skill_tools(skill_loader, allowed=skill_filter))
+    # [中文] 工作节点编写者入口 (SKILLS-SPEC §5.2)：save_skill 提议安装已完成的技能；requires_approval 引导其通过标准审批卡片，因此在保存前审查的规则自然成立。
     # The worker-authors door (SKILLS-SPEC §5.2): save_skill proposes installing a finished
     # skill; requires_approval routes it through the standard approval card, so the review-
     # before-save rule holds without any bespoke plumbing. Bundled files may only come from
@@ -544,6 +600,8 @@ def build_engine(
         )
     )
 
+    # [中文] 用户本地风险覆盖（放宽插件/收紧任意操作）+ OPE-136 信任规则（MCP 单工具免询问，持久化）。
+    # 单一存储，角色加载绝不可写入（严禁自我提权规则）。同一个实例同时服务读取端（classify 分类与受信任分支）和写入端（“始终允许此工具”）。
     # User-local risk overrides (relax a plugin / tighten anything) + OPE-136 trust
     # rules (per-MCP-tool "don't ask", durable). One store, never written by persona
     # loading (the no-self-grant rule). The same instance serves the read side
@@ -565,6 +623,8 @@ def build_engine(
         trust_overrides=override_store.trusted,
         grant_trust=override_store.set_trust,
     )
+    # [中文] plan 模式的退出大门 —— 与看板的任务拆解关卡互斥，源自团队特质：组长从不负责具体实现，因此 plan 模式对其毫无意义。
+    # 独立/工作节点角色保留 propose_plan。
     # The plan-mode exit door — mutually exclusive with the board's decomposition
     # gate, DERIVED from the team trait (owner call 2026-08-16): a lead never
     # implements, so plan mode is meaningless for it, and shipping both tools made
@@ -574,6 +634,7 @@ def build_engine(
     if agent.team != "lead":
         registry.register(propose_plan_tool())
 
+    # [中文] 组长专属关卡：propose_work_items（任务拆解 → 获批后在看板创建项目）与 propose_team（人员编制 → 获批后预先生成节点会话）。
     # The lead's gates: propose_work_items (decomposition → items on approval, any
     # mode) and propose_team (staffing → pre-spawn on approval).
     if agent.team == "lead":
@@ -582,6 +643,7 @@ def build_engine(
 
         registry.register(propose_work_items_tool())
         registry.register(propose_team_tool())
+        # [中文] §11.6：组长可请求人类为其某个工作节点分配连接器；Manual 手动组长负责响应其工作节点停放的调用。
         # §11.6: a lead may ask the human to give one of its workers a connector, and a
         # Manual lead answers its workers' parked calls (the call itself asks the human).
         registry.register(grant_connector_tool())
@@ -589,6 +651,7 @@ def build_engine(
             from .teams.tools import decide_worker_call_tool
 
             registry.register(decide_worker_call_tool(worker_decider))
+    # [中文] §11.6：任何具备连接器能力的助手均可请求人类连接可用的服务（受限于其 `connectors:` 声明中的授权上限）。
     # §11.6: any connector-capable coworker may ask the human to connect a service it
     # could use (bounded by its `connectors:` declaration — the consent ceiling).
     if agent.connectors:
@@ -596,6 +659,8 @@ def build_engine(
 
         registry.register(request_connector_tool())
 
+    # [中文] 逐轮临时的上下文：附加到最新用户消息后，因为跨提供商的会话中途系统消息不够稳定。
+    # 包含：plan 模式提醒、实时目录列表、记忆保存关闭通知、实时技能目录、禁用技能撤回通知。
     # Per-turn ephemeral context, appended to the latest user message since mid-thread system
     # messages aren't reliable across providers. Three producers: the plan-mode reminder (mode can
     # flip mid-session, so it's checked each turn, not baked into the instructions), the live
@@ -610,6 +675,8 @@ def build_engine(
     _engine_box: list = []
 
     def context_provider() -> str:
+        # [中文] 此处的内容绝不能随时间自行变化 (OPE-192)。该块粘合在提供商已经缓存的消息上，因此随时间自行变动的值
+        # （例如实时时钟）会在每轮重写该消息并废弃所有已缓存的上下文。时间现在作为工具提供 (`current_time`)。
         # Nothing here may move on its own (OPE-192). The block is glued onto a message
         # the provider has already cached, so a value that changes by itself — the live
         # clock this block carried from 2026-08-20 to 2026-09-17 — rewrites that message
@@ -622,6 +689,7 @@ def build_engine(
             parts.append(_PLAN_MODE_CONTEXT)
         elif permissions.mode is Mode.DISCUSS:
             parts.append(_DISCUSS_MODE_CONTEXT)
+        # [中文] 仅“保存”开关逐轮判断 (§4.3)：它管理操作而非知识，因此在用户切换时必须立即生效。
         # Only the SAVING switch is per-turn (§4.3): it governs an action, not
         # knowledge, so it must bite the moment the user flips it. What the coworker
         # knows stays fixed for the session — see the instructions built above.
@@ -631,6 +699,7 @@ def build_engine(
             ctx = roots_context()
             if ctx:
                 parts.append(ctx)
+        # [中文] 实时技能菜单 (SKILLS-SPEC §4.1)：每轮重新计算，因此中途安装/启用/禁用的技能从下一条消息起立即生效。
         # Live skill menu (SKILLS-SPEC §4.1): recomputed every turn like the roots list, so
         # a skill installed/enabled/disabled mid-session applies from the NEXT MESSAGE —
         # no new session, no lost context.
@@ -639,6 +708,8 @@ def build_engine(
         skills_ctx = skill_catalog_text(skill_loader, allowed=allowed)
         if skills_ctx:
             parts.append(skills_ctx)
+        # [中文] 禁用技能撤销命令 (§3)：已加载到当前对话中的指令在技能关闭/删除后仍会引导模型（历史记录无法被“反向阅读”）。
+        # 因此已加载但不再可用的技能会获得明确的停止指示，每轮重新计算。
         # Disable countermand (§3): instructions already loaded into this conversation keep
         # steering the model even after the skill is turned off/deleted — history can't be
         # un-read. So a loaded-but-no-longer-available skill gets an explicit stop note,
@@ -668,6 +739,7 @@ def build_engine(
         approver=approver,
         tool_result_max_bytes=cap,
         tool_result_spill_dir=spill_dir,
+        # [中文] 停止操作会直接终止正在前台运行的 shell 命令，而不仅仅是跳出循环。
         # Stop kills the in-flight foreground shell command, not just the loop.
         interrupt_hooks=[executor.interrupt_now] if executor is not None else None,
         max_iterations=(
@@ -685,6 +757,7 @@ def build_engine(
         team_approver=team_approver,
         items_approver=items_approver,
     )
+    # [中文] OPE-186：配置的历史压缩上限使总结器早于内置的 250,000 token 触发。
     # OPE-186 change 3: a configured compaction cap makes the summariser fire earlier
     # than the built-in 250,000-token cap. The window still comes from the model matrix.
     # OPE-189: the summariser's own output ceiling rides the same settings dict; unset
@@ -705,6 +778,8 @@ def build_engine(
     from .runtime_context import capture as capture_runtime, runtime_context_tool
     registry.register(runtime_context_tool(engine.permissions))
     engine.runtime_facts = capture_runtime(engine.permissions.workspace_root, engine.permissions._resolved_roots())
+    # [中文] 会话事实 (规范 Part 0 / §2.4)：在此刻、在智能体行动之前冻结已知世界。
+    # 冻结是核心要义 —— 相比实时状态，若智能体运行了 `git remote add backup https://attacker.net/…`，不能让其自行添加的目标被误认是已知的。
     # Session facts (spec Part 0 / §2.4): freeze the known world NOW, before the agent has
     # acted. Freezing is the whole point — compared against live state, an agent that runs
     # `git remote add backup https://attacker.net/…` would make its own destination look
@@ -717,6 +792,7 @@ def build_engine(
         )
     )
 
+    # [中文] §1.9：web_search 审批卡片指明实时的搜索引擎目标。在弹出卡片时解析，以便设置变更能实时反映。
     # §1.9: the web_search approval card names the LIVE destination ("Queries go to your
     # configured search provider (currently: ‹name›)"). Resolved when the card is raised,
     # not at session start, so a mid-session Settings change shows through.
@@ -738,6 +814,9 @@ def build_engine(
             "If required for your assignment, comment on the item and transition it to blocked, "
             "asking the lead to obtain a human decision. Do not use ask_user. Work on other unblocked items."
         )
+    # [中文] 自动审批审查器 (规范 Part 8)。仅在用户全局开关开启时附加 —— 代码仓库配置绝不能擅自开启它。
+    # 若无审查器附加，Mode.AUTO_APPROVE 的行为与 INTERACTIVE 完全一致。
+    # 使用会话自身的提供商与模型：无需第二组密钥，能被信任驱动智能体的模型也足够强大来审查它 (§1.5)。
     # Auto-Approve reviewer (spec Part 8). Attached only when the user-global flag is on —
     # a repo config can never enable it (`auto_approve` is in _GLOBAL_ONLY_FIELDS, same
     # rule as `auto_allow`). With no reviewer attached, Mode.AUTO_APPROVE behaves exactly
@@ -765,6 +844,7 @@ def build_engine(
             model=model,
             known_world=engine.session_facts.world.render() + "\nRUNTIME FACTS (availability, not access grants)\n" + json.dumps(engine.runtime_facts),
         )
+        # [中文] 影子评估（第 6 部分第 3 步）：仅开启影子开关时，附加审查器但保持实时阻断路径关闭，影子裁决绝不直接放行操作。
         # Shadow evaluation (Part 6 step 3): with only the shadow flag on, the reviewer is
         # attached but the LIVE path stays off unless the live feature flag is also on
         # and the session is in Mode.AUTO_APPROVE. Shadow verdicts never clear actions.
@@ -780,5 +860,6 @@ def build_engine(
 
 
 def build_code_engine(**kwargs: Any) -> TurnEngine:
-    """Back-compat shim: build the Code agent's engine."""
+    """[中文] 向后兼容垫片：构建 Code（代码智能体）的引擎。
+    Back-compat shim: build the Code agent's engine."""
     return build_engine(agent=code_agent(), **kwargs)

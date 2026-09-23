@@ -1,5 +1,8 @@
-"""Session manager — owns engines (one per session), stores, and the provider.
+"""会话管理器 — 掌控引擎（每个会话一个）、存储库以及模型 Provider。
+Session manager — owns engines (one per session), stores, and the provider.
 
+每个会话绑定到一个工作区目录（Code 角色需要一个工作区）。存储位于数据目录下的单一数据库中
+（对于真实服务器是全局的，对于测试是按工作区的），因此最近会话和各会话可跨目录生效。
 Each session is bound to a workspace folder (Code requires one). Storage is a single DB
 under a data dir (global for the real server, per-workspace for tests), so recents and
 sessions span folders.
@@ -269,10 +272,13 @@ def configured_opening(event, thread_target: str, folder: str) -> str:
 
 
 class SessionManager:
+    """会话管理器 — 掌控引擎生命周期、存储、Provider 路由、收件箱与工具集成。
+    Session manager — owns engine lifecycle, stores, provider routing, inbox, and tool integrations."""
+
     def __init__(
         self,
         *,
-        workspace: Optional[str | Path] = None,  # default/seed workspace (e.g. --cwd)
+        workspace: Optional[str | Path] = None,  # 默认/种子工作区（例如 --cwd）/ default/seed workspace (e.g. --cwd)
         data_dir: Optional[str | Path] = None,
         model: str = "gpt-5.6-sol",
         mode: Mode = Mode.INTERACTIVE,
@@ -294,31 +300,39 @@ class SessionManager:
         base.mkdir(parents=True, exist_ok=True)
 
         self.memory_store: MemoryStore = SQLiteMemoryStore(base / "coworker.db")
+        # MEMORY-SPEC §4.3/§6: 开关 + 用户的长期常驻规则。设置级别，独立于记忆数据表；在引擎构建时读取。
         # MEMORY-SPEC §4.3/§6: the on/off switch + the user's standing rules. Settings-
         # level, outside the memory table; read at engine build time.
         self.memory_settings = MemorySettingsStore(base / "memory-settings.json")
         self.audit_store = AuditStore(base / "coworker.db")
         self.session_store = ConversationStore(base)
-        self.session_store.canonicalize_workspaces()  # collapse /tmp vs /private/tmp etc.
+        self.session_store.canonicalize_workspaces()  # 规范化工作区路径（折叠 /tmp 与 /private/tmp 等）/ collapse /tmp vs /private/tmp etc.
         if self.default_workspace:
             self.session_store.touch_workspace(self.default_workspace)
         self._engines: dict[str, TurnEngine] = {}
+        # 连接器集合在轮次进行中发生变化的会话（§11.6）：在 mark_idle 时重建。
         # Sessions whose connector set changed mid-turn (§11.6): rebuilt at mark_idle.
         self._stale_engines: set[str] = set()
+        # 工作区在轮次进行中被提升的会话（workspace-scratch-design.md §5）：
+        # 在下一次 mark_idle 时从引擎缓存中驱逐，以便后续轮次完全基于新工作区重新构建。
         # Sessions whose workspace was promoted mid-turn (workspace-scratch-design.md §5):
         # evicted from the engine cache at the next mark_idle so the following turn
         # rebuilds fully anchored on the new workspace.
         self._promotion_rebuild: set[str] = set()
         self._running_sessions: set[str] = (
             set()
-        )  # sessions with an in-flight turn (busy)
+        )  # 正在执行轮次的活跃会话 / sessions with an in-flight turn (busy)
+        # 上一轮次结束的时间戳（规范 §Fly sandboxes，空闲停止）：控制器在停止无人使用的托管沙箱前询问。
         # When the last turn finished (spec §Fly sandboxes, idle stop): a
         # controller asks before stopping a managed box nobody is using.
         self._last_turn_at: float = time.time()
+        # 正在进行自动生成标题 LLM 调用的会话（FB-010）— 一次仅限一个调用。
         # Sessions with an auto-title LLM call in flight (FB-010) — one call at a time.
         self._autotitle_inflight: set[str] = set()
         self._autotitle_tasks: set[asyncio.Task] = set()
         self._autotitle_attempts: dict[str, int] = {}
+        # 上次尝试的开场白数量签名：在轮次开始时触发标题拟定（2026-08-24 踩坑 — 等待智能体轮次完成导致扫描运行期间会话一直无标题），
+        # 且完成钩子仍覆盖后台轮次；此防护防止两个触发点针对相同的开场消息耗费重复的尝试。
         # Opener-count signature of the last attempt: titling fires at TURN START (owner
         # catch 2026-08-24 — waiting for an agentic turn to COMPLETE left sessions
         # untitled for however long the scan ran), and the completion hook still covers
@@ -327,6 +341,8 @@ class SessionManager:
         self._autotitle_sig: dict[str, int] = {}
         self.workspace_trust = WorkspaceTrustStore()
         self.secrets = SecretStore()
+        # 未注入显式 Provider → 按模型的 `provider:` 前缀路由（默认 OpenAI、Ollama 等）。
+        # 测试直接注入 Provider 并绕过路由器。所有引擎和 `/v1/chat/completions` 代理共享同一路由器。
         # No explicit provider injected → route by the model's `provider:` prefix (OpenAI default,
         # Ollama, …). Tests inject a provider directly and bypass the router. The same router is
         # shared by every engine and the `/v1/chat/completions` proxy.
@@ -335,22 +351,31 @@ class SessionManager:
                 self.secrets, default_provider="openai", on_use=self._note_provider_use
             )
         self.mcp = MCPManager(secrets=self.secrets)
+        # 正在进行登录的 OAuth MCP 服务器 / 及其最近一次连接错误 —
+        # 为 list_mcp 的状态提供数据，以便 GUI 显示“正在授权…”及失败信息。
         # OAuth MCP servers with a sign-in in flight / their last connect error —
         # feeds list_mcp's status so the GUI can show "authorizing…" and failures.
         self._mcp_authorizing: set[str] = set()
         self._mcp_errors: dict[str, str] = {}
+        # 正在进行登录的 ChatGPT 订阅 Provider / 及其最近一次错误 —
+        # 为 provider 列表和状态路由提供数据，以便 GUI 显示“正在授权…”。
         # ChatGPT-subscription provider sign-in in flight / its last error — feeds
         # the providers list + status route so the GUI can show "authorizing…".
         self._codex_authorizing = False
         self._codex_error: Optional[str] = None
+        # 匿名连接返回 401/403 的 HTTP 服务器 — 失败原因是“需要登录”，
+        # 因此 GUI 提供 OAuth 切换入口而非粗暴的原始报错。
         # http servers whose anonymous connect came back 401/403 — the failure is
         # "needs sign-in", so the GUI offers the OAuth switch instead of a raw error.
         self._mcp_auth_hints: set[str] = set()
+        # 在为会话准备工具时连接失败的服务器 —
+        # 由 WebSocket 处理器读取一次以追加转录本通知。
         # Servers that failed to connect while preparing a session's tools —
         # drained once by the WS handler to append a transcript notice.
         self._mcp_session_failures: dict[str, list[str]] = {}
         self.gateway: Optional[Gateway] = None
         self._data_base = base
+        # 桌面/界面偏好（默认模型、新手引导状态）— 非机密；纯 JSON 文件。
         # Desktop/UI prefs (default model, onboarding state) — not secrets; a plain JSON file.
         self._prefs = self._load_prefs()
         if self._prefs.get("default_model"):
@@ -679,11 +704,12 @@ class SessionManager:
             return None
         return self.default_workspace
 
-    # -- engines ----------------------------------------------------------------
+    # -- 引擎管理 / engines ----------------------------------------------------------------
     def engine_workspace(
         self, session_id: str, *, workspace: Optional[str] = None, agent: str = "code"
     ) -> Optional[str]:
-        """The workspace `get_engine` would bind — for prepping MCP tools beforehand."""
+        """`get_engine` 将绑定到的工作区 — 用于预先准备 MCP 工具。
+        The workspace `get_engine` would bind — for prepping MCP tools beforehand."""
         record = self.session_store.load(session_id)
         if record:
             return record.workspace or None
@@ -705,6 +731,8 @@ class SessionManager:
         items_approver: Optional[Any] = None,
         connector_requester: Optional[Any] = None,
     ) -> Optional[TurnEngine]:
+        """获取或构建会话对应的 TurnEngine 实例。
+        Get or build the TurnEngine instance corresponding to the session."""
         engine = self._engines.get(session_id)
         self.reconcile_obsolete_prompts(session_id)
         self.reconcile_activity_receipts(session_id)
@@ -738,11 +766,15 @@ class SessionManager:
             model, mode, messages = record.model, Mode(record.mode), record.messages
         else:
             ws = self.resolve_workspace(workspace)
+            # 带有 `models:` 列表的 coworker 从本机可运行的第一个条目开始（§4）；
+            # 没有的话，像以前一样使用机器默认配置。
             # A coworker with a `models:` list starts on the first entry this machine
             # can run (§4); without one, the machine default as before.
             model, mode, messages = self.resolve_persona_model(agent_name), self.mode, None
 
         if not ws or not Path(ws).is_dir():
+            # 没有文件夹的会话以“孤儿”状态启动：自动配置单会话暂存草稿目录（泛化 MyHelper 的自动工作区）。
+            # 严格要求文件夹的画像（requires_folder）仍需要用户选择真实目录。
             # Sessions without a folder start "orphan": auto-provision a per-conversation
             # scratch directory (generalizes MyHelper's auto-workspace). Folder-gated
             # personas (requires_folder) still demand a real directory picked by the user.
@@ -753,6 +785,11 @@ class SessionManager:
 
         if ws:
             self.session_store.touch_workspace(ws)
+        # 通用暂存机制（Universal scratch，workspace-scratch-design.md §4）：每个会话都是多根目录架构，
+        # 并具有专属的对话级暂存目录。孤儿会话直接运行在其暂存目录上（ws == scratch，作为主目录）。
+        # 绑定真实文件夹的会话 — 门禁画像，或后来成为项目的临时工作区 — 保持该文件夹为主目录，
+        # 并获得暂存区作为第二可写根目录，使交付产物/临时文件有专门归宿，绝不会弄脏用户的代码仓库。
+        # request_directory 依托于 roots，因此现在在所有地方生效。
         # Universal scratch (workspace-scratch-design.md §4): EVERY session is multi-root
         # with a per-conversation scratch dir. Orphan sessions run ON their scratch
         # (ws == scratch, primary). Sessions on a real folder — gated personas, or a
@@ -780,12 +817,14 @@ class SessionManager:
                     *extra,
                 ]
             else:
+                # 不适合放入文件系统路径的会话 ID：仅使用主根目录。
                 # A session id we won't put in a filesystem path: primary root only.
                 roots = [{"path": ws, "writable": True, "label": "workspace"}, *extra]
             team = (record.team if record else {}) or {}
             if team.get("role") == "worker":
                 lead = self.session_store.load(str(team.get("lead_session") or ""))
                 if lead is not None:
+                    # 共享团队文件系统，包含用于 git worktrees 的 worker 专属目录。
                     # Shared team filesystem, with a worker-owned directory for worktrees.
                     for path, label in (
                         (self._provision_scratch(lead.session_id), "team scratch"),
@@ -799,15 +838,19 @@ class SessionManager:
             model=model,
             mode=mode,
             provider=self.provider,
+            # 关闭记忆（§4.3）= 停止学习新事实，而非失忆：保存的事实仍会注入并保持可用，仅移除写入工具。
+            # 在构建时读取；运行中的会话在其启动模式下完成。
             # Memory off (§4.3) = stop LEARNING, not amnesia: saved facts still inject
             # and stay usable, only the write tools go. Read at build time; running
             # sessions finish under the mode they started with.
             memory_store=self.memory_store,
             memory_workspace=self._memory_key_for(record, ws),
             memory_off=not self.memory_settings.enabled,
+            # 实时回调，而非静态快照：会话进行中关闭记忆保存必须立即生效（2026-07-28 踩坑 — 运行中会话持续保存）。
             # LIVE, not a snapshot: turning saving off mid-conversation must take
             # effect at once (owner-hit 2026-07-28 — a running session kept saving).
             memory_saving_enabled=lambda: self.memory_settings.enabled,
+            # 可调用对象，而非静态快照：在设置中编辑说明立即适用于已打开的对话（与保存开关同理）。
             # Callable, not a snapshot: editing your instructions in Settings applies
             # to conversations already open (same reason as the saving switch).
             user_rules=lambda: self._user_rules_for(session_id),
@@ -824,6 +867,9 @@ class SessionManager:
             session_id=session_id,
             audit_sink=self._audit_sink_for(session_id),
             roots=roots,
+            # WebSocket 会话传入感知模式的回调（有人值守 → 实时提示卡片，无人值守 → 收件箱）。
+            # 后台运行 / 自唤醒 self-wake / 持久化恢复运行没有实时 socket → 默认回退至基于收件箱的回调，
+            # 以便重建的引擎仍可获取批准/回答（恢复运行时，已解决的条目会立即返回）。
             # WS sessions pass mode-aware callbacks (attended → live prompt, unattended → Inbox).
             # Background / self-wake / durable-resume runs have no live socket → default to the
             # Inbox-based callbacks so a rebuilt engine can still get approvals/answers (and, on
@@ -835,6 +881,7 @@ class SessionManager:
             question_asker=question_asker
             or self.inbox_question_asker(session_id, agent),
             tool_requester=tool_requester,
+            # 团队关口和连接器请求在任何轮次均可工作（无头机器由后台投递驱动）：基于队列的处理程序为默认值。
             # The team gates and connector asks work on ANY turn (headless boxes are
             # driven by background deliveries): the queue-backed handlers are the default.
             team_approver=team_approver or self.inbox_team_approver(session_id, agent),
@@ -846,8 +893,10 @@ class SessionManager:
             subscription_register=lambda sid, addr: self.subscribe_session(sid, addr),
             worker_decider=lambda worker, call_id, decision, note: self.decide_worker_call(session_id, worker, call_id, decision, note),
             subscription_release=self._release_subscription,
+            # 按会话连接层级：仅暴露有效启用的连接器的工具。
             # Per-session connection hierarchy: expose only effective-enabled connectors' tools.
             connector_filter=self.effective_connectors(session_id, agent_name),
+            # 按会话技能菜单，实时动态（SKILLS-SPEC §3）：可调用对象，使 load_skill 能立即感知禁用/新增的技能；目录快照在构建时生成。
             # Per-session skill menu, LIVE (SKILLS-SPEC §3): a callable so load_skill sees
             # disables/new skills immediately; the catalog snapshot is taken at build.
             skill_filter=lambda sid=session_id, w=ws, a=agent_name: (

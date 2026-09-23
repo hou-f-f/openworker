@@ -1,4 +1,5 @@
-"""P2 gate tests — turn engine + event bus (scripted provider, no network)."""
+"""P2 门禁测试 — 轮次引擎与事件总线（预设脚本 Provider，无网络调用）。
+P2 gate tests — turn engine + event bus (scripted provider, no network)."""
 
 from __future__ import annotations
 
@@ -21,10 +22,14 @@ from coworker.tools import ToolRegistry
 
 
 def _text_turn(text):
+    """辅助函数：构造一个文本响应轮次。
+    Helper: construct an assistant text turn."""
     return AssistantTurn(text=text, finish_reason="stop")
 
 
 def _tool_turn(name, args, call_id="call_1"):
+    """辅助函数：构造一个工具调用轮次。
+    Helper: construct an assistant tool call turn."""
     return AssistantTurn(
         tool_calls=[ToolCall(id=call_id, name=name, arguments=args)],
         finish_reason="tool_calls",
@@ -32,7 +37,8 @@ def _tool_turn(name, args, call_id="call_1"):
 
 
 class ScriptedProvider(ProviderClient):
-    """Returns queued AssistantTurns; streams via the base default (one final chunk)."""
+    """脚本化 Provider 测试桩：按队列返回预设的 AssistantTurn；通过基类默认方式流式传输（单一最终数据块）。
+    Returns queued AssistantTurns; streams via the base default (one final chunk)."""
 
     def __init__(self, turns, *, loop=False):
         self._turns = list(turns)
@@ -48,6 +54,8 @@ class ScriptedProvider(ProviderClient):
 
 
 def _engine(tmp_path, turns, *, approver=None, loop=False, max_iterations=12):
+    """构建用于测试的 TurnEngine 实例。
+    Build a TurnEngine instance for testing."""
     provider = ScriptedProvider(turns, loop=loop)
     registry = ToolRegistry()
     registry.register_all(ai.toolkits.files(root=str(tmp_path), allow_write=True))
@@ -64,6 +72,8 @@ def _engine(tmp_path, turns, *, approver=None, loop=False, max_iterations=12):
 
 
 def _collect(engine, user_input):
+    """收集引擎运行过程中发出的所有事件。
+    Collect all events emitted during an engine run."""
     async def _run():
         return [ev async for ev in engine.run(user_input)]
 
@@ -74,10 +84,12 @@ def _types(events):
     return [ev.type for ev in events]
 
 
-# -- tests ----------------------------------------------------------------------
+# -- 测试用例 / tests ----------------------------------------------------------------------
 
 
 def test_no_tool_turn(tmp_path):
+    """测试无工具调用的单轮纯文本回复。
+    Test single-turn pure text response with no tool calls."""
     engine, _ = _engine(tmp_path, [_text_turn("all done")])
     events = _collect(engine, "hi")
     assert _types(events) == [
@@ -90,6 +102,8 @@ def test_no_tool_turn(tmp_path):
 
 
 def test_tool_turn_order_and_execution(tmp_path):
+    """测试工具调用的完整执行顺序与事件派发序列。
+    Test complete execution order and event emission sequence for tool calls."""
     (tmp_path / "a.txt").write_text("hello", encoding="utf-8")
     engine, _ = _engine(
         tmp_path,
@@ -115,6 +129,8 @@ def test_tool_turn_order_and_execution(tmp_path):
 
 
 def test_write_requires_approval_then_approved(tmp_path):
+    """测试写文件操作需要审批，批准后成功写入。
+    Test write_file requires approval, and proceeds when approved."""
     async def approve_once(_req: PermissionRequest):
         return ApprovalOutcome.ONCE
 
@@ -132,6 +148,8 @@ def test_write_requires_approval_then_approved(tmp_path):
 
 
 def test_denied_tool_yields_error_and_continues(tmp_path):
+    """测试工具调用被拒绝时向模型返回错误提示并允许其继续规划。
+    Test denied tool call yields an error to the model and allows it to continue."""
     async def deny(_req: PermissionRequest):
         return ApprovalOutcome.DENY
 
@@ -155,6 +173,8 @@ def test_denied_tool_yields_error_and_continues(tmp_path):
 
 
 def test_max_iterations_rail(tmp_path):
+    """测试超出最大迭代次数时强制终止（防护栏）。
+    Test enforcement of max iterations safety rail."""
     engine, provider = _engine(
         tmp_path, [_tool_turn("list_files", {})], loop=True, max_iterations=3
     )
@@ -166,6 +186,8 @@ def test_max_iterations_rail(tmp_path):
 
 
 def test_interrupt_between_iterations(tmp_path):
+    """测试在迭代轮次之间打断执行。
+    Test interrupt between iterations."""
     engine_holder = {}
 
     async def approve_and_interrupt(_req: PermissionRequest):
@@ -187,6 +209,8 @@ def test_interrupt_between_iterations(tmp_path):
 
 
 def test_steering_injects_next_turn(tmp_path):
+    """测试运行时引导指令（steering）在下一轮次中作为用户消息注入。
+    Test that runtime steering message injects into the next turn as a user message."""
     engine, provider = _engine(tmp_path, [_text_turn("first"), _text_turn("second")])
     engine.queue_steering("actually, also do this")
     events = _collect(engine, "do the first thing")
@@ -198,7 +222,7 @@ def test_steering_injects_next_turn(tmp_path):
     assert events[-1].data["status"] == "completed"
 
 
-# -- parallel tool execution ------------------------------------------------------
+# -- 并行工具执行测试 / parallel tool execution ------------------------------------------------------
 
 
 def _multi_tool_turn(calls):
@@ -225,9 +249,14 @@ def _bare_engine(tmp_path, turns):
 
 
 def test_low_risk_tool_calls_run_concurrently(tmp_path):
-    # Both tools block on a 2-party barrier: the turn only completes if the engine
-    # really runs them at the same time (sequential execution would trip the timeout
-    # and surface as an error result).
+    """测试低风险工具调用（如搜索/只读）并发执行优化。
+    两个工具都在一个 2 方线程屏障上阻塞：仅当引擎真正同时并发运行它们时，轮次才能完成
+    （顺序执行会触发超时并作为错误结果暴露出来）。
+
+    Test concurrent execution optimization for low-risk tool calls.
+    Both tools block on a 2-party barrier: the turn only completes if the engine
+    really runs them at the same time (sequential execution would trip the timeout
+    and surface as an error result)."""
     barrier = threading.Barrier(2, timeout=5)
     low = ai.ToolMetadata(category="search", risk_level="low", requires_approval=False)
 
@@ -252,7 +281,7 @@ def test_low_risk_tool_calls_run_concurrently(tmp_path):
     finished = [e for e in events if e.type == EventType.TOOL_FINISHED]
     assert len(finished) == 2
     assert all(e.data["status"] == "ok" for e in finished)
-    # a tool result message exists for every call id
+    # 每个调用 ID 都存在对应的工具结果消息 / a tool result message exists for every call id
     tool_ids = {
         m.get("tool_call_id") for m in engine.messages if m.get("role") == "tool"
     }

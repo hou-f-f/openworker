@@ -1,4 +1,6 @@
-"""The Chat agent — general conversation, no workspace or file/shell access."""
+"""[中文] Chat Agent（对话智能体）—— 通用日常对话，无工作区、文件或 Shell 访问权限。
+[English] The Chat agent — general conversation, no workspace or file/shell access.
+"""
 
 from __future__ import annotations
 
@@ -13,6 +15,7 @@ CHAT_INSTRUCTIONS = (
 
 
 def chat_agent() -> Agent:
+    """[中文] 构建 Chat 智能体实例。 / [English] Build the Chat agent instance."""
     return Agent(
         name="chat",
         title="Chat",

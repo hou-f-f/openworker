@@ -1,5 +1,11 @@
-"""The journal store — case-keyed knowledge that outlives boards and teams.
+"""工作日志存储库 — 案件键控知识库，生命周期超越看板和团队。
+The journal store — case-keyed knowledge that outlives boards and teams.
 
+故意与看板日志分离（2026-08-16 决策）：看板是团队域的构件，可随其团队一同归档，
+但工作日志案件跟随的是具体的排查调研（INVESTIGATION）— 它可能跨越两个看板、在团队解散后幸存，
+或者属于一个任何看板都未引用的运维（Ops）案件。
+因此案件存放在它们自己的存储库中，按案件进行哈希链式链接，并拥有自己的授权表。
+与看板保持一致的是记录形态与纪律：有明确归属主体、带时间戳、仅追加、污点标记 — 策略与审计的控制关卡在 API 层，而非数据表的共处。
 Split from the board log on purpose (decided 2026-08-16): a board is a team-scoped
 artifact and can be archived with its team, but a journal case follows the
 INVESTIGATION — it may span two boards, survive a team, or belong to an Ops case no
@@ -8,12 +14,19 @@ their own grant table. What stays unified with the board is the record shape and
 discipline: attributed, timestamped, append-only, taint-flagged — the policy/audit
 choke point is the API layer, not table co-location.
 
+访问权限模型：人类用户永远不受权限限制。其余人均需要对该案件的授权（grant）：
+- 创建案件（首次追加）授予其创建者；
+- 任务分配自动注入授权（分配一个携带案件的工作项 → 被分配者获得该案件权限；重新分配则转移）— 即“共享跟随分配”；
+- 显式授权覆盖跨团队共享场景。
 Access model: the user is never gated. Everyone else needs a grant on the case:
 - creating a case (first append) grants its creator;
 - assignment feeds grants automatically (assign an item carrying a case → the
   assignee gains it; reassignment moves it) — "sharing rides assignment";
 - explicit grants cover cross-team sharing.
 
+目前后端为 SQLite（与状态目录中的其他所有数据一致）；存储库设计得足够精炼，
+以便未来更换后端时无需修改动词接口。
+检索顺序保持为：过滤条件（此处） → 实体索引 → 作为派生索引的向量。
 Backing is SQLite for now (same as everything else in the state dir); the store is
 deliberately small enough to swap the backing later without touching the verb
 surface. Retrieval order stays: filters (here) → entity index → vectors as a
@@ -55,6 +68,9 @@ _HASHED_FIELDS = (
 
 
 class JournalStore:
+    """案件知识日志存储库 — 结构化研究记录与访问控制。
+    Case knowledge journal store — structured research records and access control."""
+
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = str(db_path)
         if self.db_path != ":memory:":

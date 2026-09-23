@@ -177,7 +177,11 @@ class PersonaRegistry:
         d = Path(directory)
         if not d.is_dir():
             return
+        # 忽略 *_cn.md 中文学习文档，避免将其误当作独立的 Persona 角色加载
+        # Ignore *_cn.md Chinese documentation files so they are not loaded as separate personas
         for md in sorted(d.glob("*.md")):
+            if md.name.endswith("_cn.md"):
+                continue
             self._register_manifest(
                 load_manifest_file(md, builtin=builtin), builtin=builtin
             )

@@ -1,4 +1,10 @@
-"""`git_log` — recent commit history for context (read-only).
+"""[中文] `git_log` —— 最近提交历史记录（只读）。
+
+aisuite 自带的 git 工具套件提供了 `git_status`/`git_diff`；本模块增加了提交历史记录，
+以便智能体在修改文件之前先查看该文件是如何演变至今的。只读操作；此处不提供 commit/push 操作
+（提示词禁止在没有用户明确要求的情况下提交代码，且即便执行也会通过 run_shell 进行）。
+
+`git_log` — recent commit history for context (read-only).
 
 aisuite's git toolkit gives `git_status`/`git_diff`; this adds history so the agent can see how
 a file came to be the way it is before changing it. Read-only; no commit/push here (the prompt
@@ -41,6 +47,9 @@ _SCHEMA = {
 
 
 def git_tools(workspace: str) -> list:
+    """[中文] 返回针对指定工作区的 Git 提交历史工具集。
+    Return the Git commit history tools for the specified workspace.
+    """
     root = str(Path(workspace).resolve())
 
     def git_log(path: Optional[str] = None, max_count: int = 20) -> dict[str, Any]:

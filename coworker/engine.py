@@ -1,4 +1,11 @@
-"""TurnEngine — the owned agent loop.
+"""【TurnEngine — 核心自主 Agent 循环】
+异步执行循环，使用 `asyncio.to_thread` 包装阻塞的 Provider 与工具调用，确保循环及消费其事件的前端界面保持响应。
+一个用户输入产生的 Turn（执行轮次）会跨越多次模型与工具的交互迭代，直到大模型停止请求工具、触发安全边界机制（Rail）、或被人为中断。
+当模型在单轮中同时请求多个工具调用时，低风险工具（读取文件、搜索等）并发并发执行；而高风险操作（写文件、执行 Shell 等）严格保持串行有序执行。
+
+人机审批通过外部注入的异步 `approver` 处理：当权限引擎裁定为 `needs_user` 时，引擎发出 `PERMISSION_REQUIRED` 事件并异步挂起等待人类裁决。
+
+TurnEngine — the owned agent loop.
 
 Async, but with blocking provider/tool calls wrapped in `asyncio.to_thread` so the loop
 (and any UI consuming its events) stays responsive. One user turn spans many model↔tool
@@ -30,9 +37,14 @@ from . import toolchain as _toolchain
 from . import toolresult
 from .events import Event, EventType
 
+# §8.4 重试保护门禁：当 Reviewer 审查者连续拒绝达到这么多次后，在当前 Turn 剩余阶段暂停自动审批
+# （2→5 + 连续语义，2026-08-24 裁定：之前累积 2 次会导致长任务在一对严苛拒绝后被误降级为纯人工审批）
 # §8.4 retry guard: the reviewer pauses for the rest of the turn after this many denials
 # IN A ROW (2→5 + streak semantics, owner ruling 2026-08-24 — a cumulative 2 silently
 # downgraded long agentic turns to hand-approval after one over-strict pair).
+#
+# OPE-171：当回复因达到输出 Token 上限被截断（finish_reason 为 "length"）且不包含任何工具调用时，不能算作有效回答——通常是深度思考消耗了全部预算导致正文空白。
+# 引擎会提示模型直接采取行动而不是以“已完成”结束当前 Turn，连续重试最多此上限次数；随后结束为 "truncated"，以便调用方区分“正常完成”与“放弃”。
 # OPE-171: a reply cut off at the output-token limit (finish_reason "length") that
 # carries no tool call is not an answer — typically thinking consumed the whole budget
 # and nothing else came back. The engine nudges the model to act instead of ending the
@@ -44,10 +56,12 @@ TRUNCATION_NUDGE = (
     "finished. Do not repeat the long reasoning. Decide the next concrete step and "
     "call a tool now, or give the final answer briefly."
 )
+# 针对被截断回复模型端看到的占位存根：因部分思考块没有签名（Anthropic 会在重放时拒绝），转录保留原始块，发送给模型时使用此存根替代
 # What the provider sees in place of the cut-off reply: its partial thinking block has
 # no signature (Anthropic rejects it on replay) and its content is empty or a fragment;
 # the transcript keeps the original, the outbound view sends this.
 TRUNCATION_STUB = "(reply cut off at the output-token limit before any action)"
+# OPE-192：每轮上下文块是瞬态且易变的（带有动态时钟）。它作为末尾独立消息以该标签开头发送，以便模型提供商将其 Prompt Cache 断点保持在最后一个稳定块上
 # OPE-192: the per-turn context block is ephemeral and volatile (it carries a clock). It is
 # sent as its own trailing message opening with this tag, so a provider can keep its cache
 # breakpoint on the last STABLE block and leave the note outside the cached prefix.
@@ -68,21 +82,36 @@ from .tools import ToolRegistry
 logger = logging.getLogger(__name__)
 
 class ApprovalOutcome(str, Enum):
+    # 单次批准本次调用
+    # Approve this invocation only
     ONCE = "once"
+    # 始终允许该工具调用
+    # Always allow this tool
     ALWAYS_TOOL = "always_tool"
+    # 始终允许此前缀的命令执行
+    # Always allow commands matching this prefix
     ALWAYS_COMMAND = "always_command"
+    # 始终允许访问此域名
+    # Always allow egress to this domain
     ALWAYS_DOMAIN = "always_domain"
+    # 会话级授权：放行经分类器核准的只读 Shell 命令 (readonly.py)
     # Session-wide grant for classifier-approved read-only shell commands (readonly.py).
     READONLY_SESSION = "readonly_session"
+    # OPE-136 长期信任：持久化保存针对某个 MCP 工具的“无需询问”规则——跨会话生效，可在配置页撤销
     # OPE-136 durable trust: persist a per-tool "don't ask" rule for an MCP tool —
     # survives sessions, revocable on the server's detail page. MCP-only (validated
     # server-side in manager._grant_offered, like every other grant).
     ALWAYS_TRUST = "always_trust"
+    # OPE-136 单次运行授权（“在当前请求中允许”）：仅在当前单次运行的剩余阶段放行该工具——保存在内存中，运行结束即清除
     # OPE-136 run grant ("Allow for this request"): cover this exact tool for the
     # remainder of the CURRENT run only — in-memory, cleared at the run boundary,
     # nothing persisted. EXTERNAL-risk tools only (validated server-side).
     THIS_RUN = "this_run"
+    # 拒绝执行
+    # Deny tool call
     DENY = "deny"
+    # 已被后续操作取代废弃
+    # Superseded by subsequent action
     SUPERSEDED = "superseded"
 
 
@@ -364,7 +393,7 @@ class TurnEngine:
     ) -> None:
         self._steering.append((text, source, activity))
 
-    # -- main loop --------------------------------------------------------------
+    # -- 核心执行主循环 (main loop) --------------------------------------------------------------
     async def run(
         self,
         user_input: "str | list",
@@ -373,6 +402,16 @@ class TurnEngine:
         display: Optional[str] = None,
         activity: Optional[dict[str, Any]] = None,
     ) -> AsyncIterator[Event]:
+        """【执行轮次入口】处理一次用户输入或外部触发事件，产出结构化执行事件流。
+
+        Run a single user turn, yielding structured execution events.
+        """
+        # `user_input` 可以是纯文本字符串，也可以是多模态 content-parts 数组（文本 + 图片附件）。
+        # `source` 是连接器消息的伴生元数据（仅供前端展示）：它保存在持久化用户消息与 TURN_START 事件中，
+        # 但在发往大模型前会被剥离。
+        # `display` 针对强制运行的技能指令：将用户输入的 "/skill …" 保存在转录中，而 `content` 携带真正发给模型的框架 Prompt。
+        # 服务重启可能中断处于 tool_use 与 tool_result 之间的未完结轮次（如挂起的人工审批）。
+        # 大模型会拒绝此类悬空的破损历史，因此新 Turn 必须先用合法的存根修复所有孤儿调用，防止会话永久损坏。
         # `user_input` is a string, or OpenAI content-parts (text + image_url) for attachments.
         # `source` (a MessageSource dict) is a display-only sidecar for connector messages: it
         # rides on the persisted user message + the TURN_START event, but is stripped before the
@@ -401,6 +440,7 @@ class TurnEngine:
         self._cancel.clear()
         if self.session_facts is not None:
             self.session_facts.begin_turn()
+        # §8.4 重试保护计数器每轮重置：连续拒绝达到上限则将该轮剩余所有操作路由至人工确认
         # §8.4 retry guard resets per user turn: two reviewer denials in one turn route
         # everything else that turn to the human. A fresh user message is a fresh brief.
         self._reviewer_denials = 0
@@ -412,6 +452,7 @@ class TurnEngine:
             data["source"] = source
         if display is not None:
             data["display"] = display
+        # OPE-136 单次运行授权清空：全新轮次从干净状态开始
         # OPE-136 run grants: a fresh run starts with a clean slate (belt — the
         # finally below is the braces; an abandoned generator must not leak a
         # previous answer's "Allow for this request" into this one).
@@ -421,6 +462,7 @@ class TurnEngine:
             async for event in self._loop():
                 yield event
         finally:
+            # 运行边界即为授权失效之时：正常完工、Stop 停止、以及生成器意外断开均会触发清理
             # The run boundary IS the grant's expiry — normal finish, Stop, and
             # generator teardown (disconnect) all land here.
             self.permissions.clear_run_allowances()
@@ -1024,9 +1066,17 @@ class TurnEngine:
     async def _handle_tool_calls(
         self, tool_calls: list[ToolCall]
     ) -> AsyncIterator[Event]:
-        """Run one assistant turn's tool calls: authorize all of them first (sequentially —
+        """【处理工具调用】执行大模型在单轮中请求的所有工具调用：
+        首先依序进行权限鉴权（交互式审批需逐个向用户展示），随后分流执行。
+        低风险操作（文件读取、搜索等）通过并发执行提高吞吐量；高风险操作（写文件、Shell 等）严格按顺序串行执行。
+
+        Run one assistant turn's tool calls: authorize all of them first (sequentially —
         approval prompts are interactive), then execute. Low-risk calls (reads, searches)
         run concurrently; everything else runs one at a time in call order."""
+        # 自动审批机制 (Auto-Approve)：在串行鉴权循环之前，并发向 Reviewer 审查者大模型提交所有待审查的工具调用
+        # （规范 §8.6 —— 每次请求审查一个动作，并发发起多个；审查 N 个调用的耗时仅相当于单次网络往返，
+        # 且裁决结论在物理上绝不会张冠李戴绑定到错误的动作上）。
+        # 下方的授权循环保持串行，因为人机审批弹窗具有交互性，必须按调用顺序逐个呈现给用户。
         # Auto-Approve: fire the reviewer for every call that will need it, all at once,
         # BEFORE the sequential authorize loop (spec §8.6 — one action per request, sent
         # concurrently; the wall-clock cost of reviewing N calls is one round-trip, and a
@@ -1037,6 +1087,7 @@ class TurnEngine:
         cleared: list[ToolCall] = []
         for tool_call in tool_calls:
             if self._cancel.is_set():
+                # 收到中断信号：所有剩余调用依然生成应答存根（避免留下破损的孤儿调用）
                 # Stopped: every remaining call still gets an answer (no orphans).
                 yield self._interrupted_tool(tool_call)
                 continue
@@ -1046,12 +1097,15 @@ class TurnEngine:
             )
             self._audit(tool_call, stage="proposed")
             if _is_mangled(tool_call):
+                # 参数无法解析为合法 JSON（大模型返回了 `{"_raw": …}` 降级兜底）。
+                # 若直接执行会产生让模型困惑的参数报错，现场容易演变为死循环。在此直接返回准确的诊断提示。
                 # The arguments never parsed as JSON (a `{"_raw": …}` fallback from the
                 # provider). Executing would produce a bare parameter error the model
                 # misreads — seen in the field as an endless "wrong parameter" retry
                 # loop. Answer with the ACTUAL diagnosis instead.
                 yield self._mangled_tool(tool_call)
                 continue
+            # 交互式内置系统门禁：直接交由外部专有处理器完成交互确认，跳过通用的工具注册中心执行
             # `request_directory` and `propose_plan` are interactive: the user decides
             # out-of-band and that decision IS the consent, so they skip the
             # permission/registry path.
@@ -1093,6 +1147,8 @@ class TurnEngine:
             if allowed:
                 cleared.append(tool_call)
 
+        # 区分安全并发调用与严格串行调用
+        # Partition cleared calls into concurrent (safe reads) and serial (writes/exec)
         concurrent = (
             [tc for tc in cleared if self._parallel_safe(tc)]
             if len(cleared) > 1
@@ -1101,6 +1157,8 @@ class TurnEngine:
         serial = [tc for tc in cleared if tc not in concurrent]
 
         if concurrent:
+            # 并发执行低风险只读工具
+            # Concurrently execute safe read-only tools
             for tool_call in concurrent:
                 yield Event(EventType.TOOL_STARTED, {"name": tool_call.name})
                 self._audit(tool_call, stage="started")
@@ -1110,6 +1168,8 @@ class TurnEngine:
             for tool_call, (result, status) in zip(concurrent, outcomes):
                 yield self._record_result(tool_call, result, status)
 
+        # 串行执行高风险或写操作工具
+        # Serially execute high-risk or mutating tools
         for tool_call in serial:
             if self._cancel.is_set():
                 yield self._interrupted_tool(tool_call)
@@ -1164,6 +1224,7 @@ class TurnEngine:
         )
 
     def _parallel_safe(self, tool_call: ToolCall) -> bool:
+        # [中文] 仅元数据声明为低风险的工具（读操作、搜索、git 查询）并发运行；写操作、shell 及任何未标注的工具保持严格顺序执行。
         # Only metadata-declared low-risk tools (reads, searches, git queries) run
         # concurrently; writes, shell, and anything unannotated stay strictly ordered.
         spec = self.registry.get(tool_call.name)
@@ -1175,7 +1236,10 @@ class TurnEngine:
     # -- Auto-Approve reviewer (spec Part 8) ----------------------------------------
 
     def _reviewer_active(self) -> bool:
-        """The reviewer is consulted only when ALL of these hold. Any miss ⇒ today's
+        """[中文] 仅当以下所有条件均满足时才咨询审查器。任何一项不满足 ⇒ 执行原逻辑（弹出审批卡片）。
+        明确要求 attended（有人值守）：未设置 `is_attended` 视为非值守，因此自动化流程（绝不设置该标志）永远不会被审查器审查（§1.5：该模式仅限有人值守）。
+
+        The reviewer is consulted only when ALL of these hold. Any miss ⇒ today's
         behaviour (the card). Attended is required explicitly: `is_attended` unset counts
         as NOT attended, so automations — which never set it — can never be reviewed
         (§1.5: the mode is attended-only)."""
@@ -1191,7 +1255,18 @@ class TurnEngine:
         )
 
     def _user_history(self) -> tuple[str, list[dict[str, Any]]]:
-        """(current request, earlier unsourced user messages), extracted
+        """[中文] (当前请求, 较早未标注来源的用户消息)，机械化提取 (§8.2)。
+        绝不包含智能体输出、工具结果或摘要。
+
+        `ask_user` 的回复从 `_ask_replies` 合并进来（在到达时捕获，而非从工具外壳解析），
+        标记为 `is_reply`，以便 `render_history` 打印 §8.3 指令已知晓如何权衡的
+        "[reply to a question the agent asked]" 标记。回复始终属于历史记录，绝不能成为当前请求 ——
+        “ok proceed（好的继续）”绝不能变成评估该操作的核心基准。
+
+        附件通过 `reviewer_text` (§4.4) 折叠为中立标记：审查器仅得知附带了一个文件，
+        但绝不会知道文件内容 —— 附件正文属于附带在用户轮次上的外部编写文本。
+
+        (current request, earlier unsourced user messages), extracted
         mechanically (§8.2). Never agent output, never tool results, never a summary.
 
         `ask_user` answers are merged in from `_ask_replies` (captured as they arrived, not
@@ -1244,7 +1319,10 @@ class TurnEngine:
             return "", [], {"context_unavailable": True}
 
     def _downloaded_target(self, tool_call: ToolCall) -> Optional[Any]:
-        """A file this call would run that the agent DOWNLOADED this session, or None.
+        """[中文] 本次调用拟运行的由智能体在本会话中下载的文件，若无则为 None。
+        “先下载再执行”链条不存在任何被默许的合法形式，因此会绕过审查器和任何命令白名单直接升级给人工确认 (OPE-114 §1)。
+
+        A file this call would run that the agent DOWNLOADED this session, or None.
         Fetch-then-execute has no quiet legitimate form, so it reaches a person over both
         the reviewer and any command allowlist (OPE-114 §1)."""
         match = self._agent_files.match(
@@ -1253,7 +1331,10 @@ class TurnEngine:
         return match if match is not None and match.downloaded else None
 
     def _provenance(self, tool_call: ToolCall) -> str:
-        """One line naming a file this call would run that the agent itself created, or ""
+        """[中文] 用单行指明该调用拟运行的、由智能体自身创建的文件，若无则为空字符串 "" (§8.2)。
+        使用固定词汇 —— 绝不包含文件内容，绝不包含外部编写的文本，从而维持无不受信任内容的原则。
+
+        One line naming a file this call would run that the agent itself created, or ""
         (§8.2). Fixed vocabulary — never file contents, never outside-authored text, so the
         no-untrusted-content rule holds."""
         match = self._agent_files.match(
@@ -1262,7 +1343,11 @@ class TurnEngine:
         return match.render() if match else ""
 
     async def _preconsult_reviewer(self, tool_calls: list[ToolCall]) -> None:
-        """Fire one reviewer request per call that will escalate, all concurrently, and
+        """[中文] 对每个即将升级的调用并发发起审查器请求，并将裁决暂存以供 `_authorize` 使用。
+        每次请求对应一个操作 —— 不存在需要重新配对的裁决列表，因此裁决绝不会落在错误的操作上 (§8.6)。
+        跳过门控引擎已做出决定的调用（直接允许或硬性拒绝）：审查器只会看到原本会变成人工审批卡片的调用 (§1.2)。
+
+        Fire one reviewer request per call that will escalate, all concurrently, and
         park the verdicts for `_authorize` to consume. One action per request — there is
         no verdict list to pair back, so a verdict cannot land on the wrong action (§8.6).
         Skips calls the gate already decides (allow or hard-deny): the reviewer only ever
@@ -1378,7 +1463,13 @@ class TurnEngine:
         return (tool_name, canon)
 
     def approve_action_once(self, tool_name: str, arguments: dict[str, Any] | None) -> None:
-        """Register a one-shot human approval for this EXACT action (§8.4 "Allow anyway").
+        """[中文] 针对此“完全一致”的操作注册一次性的人工批准（§8.4 “仍然允许 / Allow anyway”）。
+
+        当用户点击拒绝卡片上的允许按钮时由服务器调用 —— 这是用户在看到审查器的完整拒绝理由后做出的人工决定。
+        当再次提议完全相同的操作（相同的工具、逐字节相同的规范化参数）时，将无需审查器或审批卡片直接运行；
+        任何稍有不同的操作仍需经过常规流程。绝非长期有效：首次使用后即刻被消耗。
+
+        Register a one-shot human approval for this EXACT action (§8.4 "Allow anyway").
 
         Called by the server when the user clicks the deny card — a human decision made
         with the full reviewer reason in front of them. The next proposal of the identical
@@ -1409,7 +1500,11 @@ class TurnEngine:
         return False
 
     def _spawn_shadow_review(self, tool_call: ToolCall) -> None:
-        """Shadow evaluation (spec Part 6 step 3): record what the reviewer WOULD have
+        """[中文] 影子评估（规范第 6 部分第 3 步）：记录审查器“本来会”对这张审批卡片做出什么裁决，而不改变任何实际行为。
+        即发即弃（Fire-and-forget）—— 卡片立即渲染展示；当审查调用返回时，裁决通过 `call_id` 关联并记录到审计日志中与人工的 `approval_resolved` 行一起。
+        此处特意没有设计从影子裁决通往实际决策的代码路径。
+
+        Shadow evaluation (spec Part 6 step 3): record what the reviewer WOULD have
         decided about this card, without touching anything. Fire-and-forget — the card
         renders immediately; the verdict lands in the audit log when the call returns,
         joined to the human's `approval_resolved` row by `call_id`. There is deliberately
@@ -1452,12 +1547,16 @@ class TurnEngine:
         task.add_done_callback(self._shadow_tasks.discard)
 
     async def drain_shadow_reviews(self) -> None:
-        """Await in-flight shadow verdicts (tests and orderly shutdown; never the hot path)."""
+        """[中文] 等待进行中的影子评估裁决完成（用于测试和有序关机；绝不在关键热路径上调用）。
+        Await in-flight shadow verdicts (tests and orderly shutdown; never the hot path)."""
         if self._shadow_tasks:
             await asyncio.gather(*list(self._shadow_tasks), return_exceptions=True)
 
     async def _authorize(self, tool_call: ToolCall) -> "AsyncIterator[Event | bool]":
-        """Permission flow for one call (TOOL_PROPOSED is emitted by the caller). Yields
+        """[中文] 单个调用的权限鉴权流（TOOL_PROPOSED 由调用方发出）。
+        先产出产生的事件，最后产出 True/False（是否允许执行）。被拒绝或未知的调用在此处追加其工具错误消息。
+
+        Permission flow for one call (TOOL_PROPOSED is emitted by the caller). Yields
         its events, then True/False (allowed) last. Denied/unknown calls get their
         tool-error message appended here."""
         from .permissions import standing_rule_candidate
@@ -2001,7 +2100,11 @@ class TurnEngine:
             pass
 
     async def _handle_items_proposal(self, tool_call: ToolCall) -> AsyncIterator[Event]:
-        """The decomposition gate: emit the proposed items, await the user's decision.
+        """[中文] 任务拆解关卡：发出拟提议的工作项，等待用户决定。
+        批准后会在看板上创建这些工作项（服务端内部在审批器中创建），结果中携带它们的 id；
+        拒绝则返回修改建议反馈以供重新拆解。
+
+        The decomposition gate: emit the proposed items, await the user's decision.
         Approval creates them on the board (server-side, inside the approver) and the
         result carries their ids; rejection returns feedback for a revised split."""
         from .teams.proposals import validate_work_proposal
@@ -2052,7 +2155,11 @@ class TurnEngine:
         )
 
     async def _handle_connector_request(self, tool_call: ToolCall) -> AsyncIterator[Event]:
-        """`request_connector` (ask the human to connect a service) and `grant_connector`
+        """[中文] `request_connector`（请求人类连接某项服务）和 `grant_connector`（组长请求人类授予其某个工作节点连接器权限）—— 规范 §11.6。
+        两者均为人工审批关卡：发出 CONNECTOR_REQUESTED 事件，等待带外判定并返回。
+        拒绝属于正常结果，助手必须绕过该项限制继续工作并如实说明；这绝不是错误。
+
+        `request_connector` (ask the human to connect a service) and `grant_connector`
         (a lead asks the human to give one of its workers a connector) — spec §11.6.
         Both are human gates: emit CONNECTOR_REQUESTED, await the out-of-band verdict,
         hand it back. Declining is a normal outcome the coworker must work around and
@@ -2093,7 +2200,11 @@ class TurnEngine:
         )
 
     async def _handle_team_proposal(self, tool_call: ToolCall) -> AsyncIterator[Event]:
-        """The staffing gate: emit the proposed roster, await the user's out-of-band
+        """[中文] 人员配备关卡：发出拟组建的花名册，等待用户的带外决定。
+        批准后会预先生成各工作节点会话（服务端内部在审批器中创建），返回的花名册中包含 actor id，以便组长分派任务；
+        拒绝则返回用户的反馈以便修改方案。
+
+        The staffing gate: emit the proposed roster, await the user's out-of-band
         decision. Approval PRE-SPAWNS the worker sessions (server-side, inside the
         approver) and the result carries the roster with actor ids so the lead can
         assign; rejection returns the user's feedback for a revised proposal."""
@@ -2161,7 +2272,11 @@ class TurnEngine:
         )
 
     async def _handle_plan_proposal(self, tool_call: ToolCall) -> AsyncIterator[Event]:
-        """Emit the plan for review, await the user's out-of-band decision, and apply it:
+        """[中文] 发送计划供审查，等待用户的带外决定并应用：
+        批准后会将运行中的 PermissionEngine 切换出 plan（计划）模式（同一个会话继续运行，保留所有探索上下文）；
+        拒绝则保持 plan 模式并返回用户反馈以便智能体进行修订。
+
+        Emit the plan for review, await the user's out-of-band decision, and apply it:
         approval flips the live PermissionEngine out of plan mode (the same session keeps
         going, with all its exploration context); rejection keeps plan mode and returns
         the user's feedback so the agent can revise."""
@@ -2228,7 +2343,10 @@ class TurnEngine:
         )
 
     async def _handle_tool_request(self, tool_call: ToolCall) -> AsyncIterator[Event]:
-        """Emit the install prompt, await the user's decision, hand the outcome back.
+        """[中文] 发出安装提示卡片，等待用户决定并返回结果。
+        拒绝属于正常结果而非错误：结果会告知智能体寻找备用方案并公开披露能力缺失，因为悄无声息漏掉检查的安全报告远比明确告知哪些检查未执行的报告更恶劣。
+
+        Emit the install prompt, await the user's decision, hand the outcome back.
 
         Declining is a normal outcome, not an error: the result tells the agent to fall back
         and disclose the gap, because a security report that quietly loses a check is worse
@@ -2327,7 +2445,8 @@ class TurnEngine:
     async def _handle_directory_request(
         self, tool_call: ToolCall
     ) -> AsyncIterator[Event]:
-        """Emit the grant prompt, await the user's out-of-band decision (which the requester also
+        """[中文] 发出授权提示，等待用户的带外决定（请求者也会将其应用于当前会话的根目录集），并将结果作为工具结果返回。
+        Emit the grant prompt, await the user's out-of-band decision (which the requester also
         applies to this session's roots), and return the outcome as the tool result."""
         args = tool_call.arguments or {}
         if self.directory_requester is None:
@@ -2380,7 +2499,8 @@ class TurnEngine:
         )
 
     async def _handle_ask_user(self, tool_call: ToolCall) -> AsyncIterator[Event]:
-        """Emit the question, await the user's out-of-band answer (inline in the live session or
+        """[中文] 发送问题，等待用户的带外答复（在有人值守的实时会话中为内联交互，无人值守时进入收件箱 Inbox），并将答复作为工具结果返回。
+        Emit the question, await the user's out-of-band answer (inline in the live session or
         from the Inbox when unattended), and return it as the tool result."""
         args = tool_call.arguments or {}
         question = str(args.get("question", "")).strip()
@@ -2435,7 +2555,13 @@ class TurnEngine:
     def _note_ask_replies(
         self, result: dict[str, Any], question: str = ""
     ) -> None:
-        """Record the user's ask_user answer(s) for the reviewer's history (§8.2),
+        """[中文] 记录用户对 ask_user 的回答以供审查器历史参考 (§8.2)，连同智能体提出的问题一同记录 ——
+        向裁决者展示时明确标注为智能体编写的数据（与工具参数遵循相同的 Rule-3 纪律），以便结构化回答严格作为该问题范围内的证据（所有者裁定 2026-08-24）。
+        锚定于当前存在的用户消息数量，因此无论后续会话如何继续，合并始终保持时间顺序。
+
+        新的回答还会重置 §8.4 的拒绝连续计数：用户在场且刚给出了指示 —— 审查器理应对后续操作进行重新评估。
+
+        Record the user's ask_user answer(s) for the reviewer's history (§8.2),
         together with the agent's question — shown to the judge explicitly framed as
         agent-authored data (same Rule-3 discipline as tool arguments), so a structured
         answer counts as evidence for exactly the question's scope (owner ruling
@@ -2473,7 +2599,13 @@ class TurnEngine:
         self._steering = []
 
     def _outbound_messages(self) -> list[dict[str, Any]]:
-        """`self.messages` prepared for the provider. The SOLE provider feed (see `_astream`).
+        """[中文] 为提供商（Provider）准备好的 `self.messages`。提供商输入的唯一来源（见 `_astream`）。
+
+        无条件从每条消息中剥离仅供展示的附随字段（sidecars）—— `source`, `_display`, 以及 `ts`（提供商会拒绝未知键）——
+        无论是否添加 `<system-context>` 块。当 context_provider 产出非空字符串时，一个临时的 `<system-context>` 块会被追加到最后一条用户消息中。
+        绝不修改 `self.messages` 本身，因此剥离字段和临时上下文块都不会被持久化或在回放中出现。
+
+        `self.messages` prepared for the provider. The SOLE provider feed (see `_astream`).
 
         Every message is stripped of the display-only sidecars — `source`, `_display`, and
         `ts` — (providers reject unknown keys), unconditionally — whether or not a

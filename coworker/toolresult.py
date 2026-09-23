@@ -1,4 +1,13 @@
-"""Bound every tool result before it enters the conversation (OPE-186, change 1).
+"""【工具结果尺寸限制】在工具返回结果注入会话上下文之前对其进行硬性尺寸截断与外溢存储（OPE-186）。
+
+工具结果会在后续每一次 Turn 中重新发送给大模型，因此单次超大的工具输出会持续拖累整个会话的 Token 消耗和性能。
+处理机制（在 `TurnEngine._record_result` 中统一调用）：若序列化后的内容超出 `max_bytes`，全量原始内容将转储（Spill）到本地磁盘临时文件，
+超长字段被替换为“头部内容 + 提示标记（标明外溢文件路径与省略字节数） + 尾部内容（Head + Tail）”。
+保留头部和尾部是因为编译构建日志既需要前部的首个报错信息，又需要尾部的最终退出结论。
+该标记不包含动态时间戳，因此多次重放时字节级完全一致，绝不会破坏模型的 Prompt Cache 缓存命中。
+对于结构化字典结果，仅截断最大的字符串字段，保持 JSON 结构合法完整。
+
+Bound every tool result before it enters the conversation (OPE-186, change 1).
 
 A tool result is re-sent to the model on every later turn, so one oversized result taxes
 the whole rest of the session. The shell tool used to keep the LAST 20,000 characters of
@@ -24,16 +33,23 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
+# 默认工具结果最大允许字节数 (10KB)
+# Default max bytes for a tool result (10KB)
 DEFAULT_TOOL_RESULT_MAX_BYTES = 10_000
+# 计算首尾截断空间时为标记行与 JSON 转义预留的字节数
 # Bytes set aside for the marker line and JSON escaping when sizing head + tail.
 _MARKER_RESERVE = 400
+# 无论配额多小，首尾保留的总字节数绝不低于此下限 (1000B)
 # Never shrink a field below this many bytes of head + tail, whatever the budget says.
 _MIN_KEEP = 1_000
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
 class PagedToolResult(dict):
-    """Trusted native reader result with its own bounded, replayable pagination.
+    """【受信任的分页工具结果】原生分页工具的返回结果，具备自身受限且可重放的分页游标。
+    无需对其执行首尾截断：游标已精确描述了返回的范围。仅限原生 Python 代码构造。
+
+    Trusted native reader result with its own bounded, replayable pagination.
 
     Do not head/tail its text: the cursor describes exactly the returned range.
     JSON/tool payloads cannot opt in; only native code can construct this type.
@@ -41,7 +57,10 @@ class PagedToolResult(dict):
 
 
 def serialize_result(result: Any) -> str:
-    """Exactly what `_tool_result_message` puts in the message content."""
+    """【序列化结果】将工具执行结果序列化为字符串，与消息内容保持一致。
+
+    Exactly what `_tool_result_message` puts in the message content.
+    """
     return result if isinstance(result, str) else json.dumps(result, default=str)
 
 
@@ -50,7 +69,9 @@ def _nbytes(text: str) -> int:
 
 
 def head_tail(text: str, keep_bytes: int, *, spill_path: Optional[Path], total_bytes: int) -> str:
-    """First half of `keep_bytes`, a marker, last half. Cuts are byte-based and decoded
+    """【首尾截断拼接】保留前一半字节、中间插入省略标记与外溢文件路径、保留后一半字节。
+
+    First half of `keep_bytes`, a marker, last half. Cuts are byte-based and decoded
     with errors ignored so a multi-byte character split at the boundary is dropped, never
     corrupted."""
     keep = max(int(keep_bytes), _MIN_KEEP)

@@ -1,4 +1,12 @@
-"""Workspace roots — the directories a session is allowed to touch.
+"""【工作区根目录模型】会话获准访问的目录集合（Workspace Roots）。
+
+一个 Cowork 会话拥有一个专属的临时 scratch 目录（作为第 0 个主根目录，默认可写，是默认保存文件的位置），
+并且可以通过用户授权获得对额外目录的访问权限（每个目录可独立配置只读或读写）。
+同一个 `list[RootDir]` 对象通过内存引用在 PermissionEngine（权限范围裁决）、
+文件工具箱（路径解析与边界校验）以及上下文注入器（向模型告知当前可用目录）之间共享，
+使得运行时动态增减授权目录能够被所有组件实时感知。第 0 个元素始终为主目录。
+
+Workspace roots — the directories a session is allowed to touch.
 
 A Cowork session is "orphan": it owns a per-conversation **scratch** dir (the primary root,
 writable, the default save location) and may gain access to additional folders, each chosen
@@ -17,9 +25,13 @@ from typing import Any, Iterable
 
 @dataclass
 class RootDir:
+    """【授权根目录条目】封装目录的绝对路径、是否可写及展示标签。
+
+    Authorized directory entry encapsulating absolute path, writability, and label.
+    """
     path: Path
     writable: bool = False
-    label: str = ""  # display name; defaults to the dir's basename
+    label: str = ""  # 展示名称；默认使用目录的 basename / display name; defaults to the dir's basename
 
     def __post_init__(self) -> None:
         self.path = Path(self.path).expanduser().resolve()
@@ -31,7 +43,10 @@ class RootDir:
 
 
 def normalize_roots(roots: Iterable[Any] | None) -> list[RootDir]:
-    """Coerce a mixed list (RootDir | dict{path,writable,label} | str/Path) into RootDirs.
+    """【规范化根目录列表】将混合类型列表转为统一的 RootDir 对象列表。
+    裸字符串/Path 默认视为只读；传入 dict 或 RootDir 可显式赋予写权限。
+
+    Coerce a mixed list (RootDir | dict{path,writable,label} | str/Path) into RootDirs.
     Bare str/Path entries are treated as read-only; pass dicts/RootDirs to grant write.
     """
     out: list[RootDir] = []
@@ -59,7 +74,9 @@ def normalize_roots(roots: Iterable[Any] | None) -> list[RootDir]:
 
 
 def render_context(roots: list[RootDir]) -> str:
-    """The `<system-context>` body listing the dirs available this turn. Empty when no roots."""
+    """【渲染目录上下文】生成包含当前轮次可用目录清单的 `<system-context>` 块内容。若无目录则返回空。
+
+    The `<system-context>` body listing the dirs available this turn. Empty when no roots."""
     if not roots:
         return ""
     lines = ["Available directories (you may use file/shell tools within these):"]

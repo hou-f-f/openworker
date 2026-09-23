@@ -1,4 +1,10 @@
-"""Risk classes for tools — the intrinsic side-effect category that drives permission
+"""【工具风险分类】工具的内生副作用风险等级，用于驱动权限门禁判定（以及无人值守收件箱路由）。
+
+取代原先权限引擎中硬编码的 `WRITE_TOOLS` / `SHELL_TOOL` 名称集合：风险等级现在作为声明式属性由统一的 `classify` 函数解析。
+工具的最终有效风险 = 用户本地覆盖（可选）与基础分类的融合判定。
+内置经过审计的工具通过名称直接查表；第三方工具依据 aisuite 元数据（`requires_approval` → external）或默认视为只读。
+
+Risk classes for tools — the intrinsic side-effect category that drives permission
 gating (and, later in Phase 2, unattended Inbox routing).
 
 This replaces the hardcoded ``WRITE_TOOLS`` / ``SHELL_TOOL`` name sets the permission engine
@@ -16,16 +22,28 @@ from typing import Any, Callable, Optional
 
 
 class RiskClass(str, Enum):
-    READ = "read"  # no side effects — always allowed
-    EGRESS = "egress"  # reaches the network — the request itself can carry data off-machine
-    WRITE_LOCAL = "write_local"  # mutates the workspace — path-scoped + mode-gated
-    EXEC = "exec"  # runs commands — mode-gated
-    EXTERNAL = "external"  # side effects off the machine — the unattended Inbox hook
+    # 只读无副作用 — 始终允许执行
+    # no side effects — always allowed
+    READ = "read"
+    # 网络外联 — 请求本身可能将数据携带到机器外部
+    # reaches the network — the request itself can carry data off-machine
+    EGRESS = "egress"
+    # 修改本地工作区 — 受路径范围与运行模式限制
+    # mutates the workspace — path-scoped + mode-gated
+    WRITE_LOCAL = "write_local"
+    # 执行终端命令 — 受运行模式限制
+    # runs commands — mode-gated
+    EXEC = "exec"
+    # 机器外部副作用 — 触发无人值守模式下的收件箱挂起门禁
+    # side effects off the machine — the unattended Inbox hook
+    EXTERNAL = "external"
 
 
+# 内置写工具名称集合
 # Built-in tools whose risk is fixed by name (the old WRITE_TOOLS / SHELL_TOOL, as data).
 WRITE_TOOLS = {"write_file", "replace_in_file", "apply_patch", "apply_unified_diff"}
 SHELL_TOOL = "run_shell"
+# 模型自主发起的网络外联工具
 # Model-chosen network egress. `web_fetch` takes a URL straight from the model and the
 # URL's path/query can carry data outbound, so it is NOT a pure read — it must reach the
 # gate. `web_search` reaches a FIXED destination (the configured provider), but its query

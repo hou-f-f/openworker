@@ -1,4 +1,15 @@
-"""ProviderRouter — one `ProviderClient` that dispatches by the `provider:` prefix of a model
+"""[中文] ProviderRouter —— 一个统一的 `ProviderClient`，它根据模型字符串中的 `provider:` 前缀
+分发到具体的提供商客户端，该客户端从 SecretStore 配置中延迟构建并进行缓存。
+
+这是 `SessionManager` 传递给每个引擎的唯一提供商客户端，因此 `complete()/stream()`
+（每次调用都会接收完整的模型字符串）能够自行完成路由：例如 `ollama:llama3.3` →
+Ollama 客户端（Ollama 兼容 OpenAI 的 `/v1`），纯 `gpt-5.5` → 默认提供商（OpenAI）。
+在委托调用之前前缀会被剔除，因为底层 SDK 需要纯粹的模型名称。
+
+配置变更（新增 API 密钥、新的 Ollama 地址）调用 `invalidate()` 来废弃已缓存的客户端，
+从而让现有引擎无需重建即可应用最新配置。
+
+ProviderRouter — one `ProviderClient` that dispatches by the `provider:` prefix of a model
 string to a per-provider client, built lazily from its SecretStore profile and cached.
 
 This is the single provider the `SessionManager` hands to every engine, so `complete()/stream()`
@@ -32,6 +43,8 @@ class ProviderRouter(ProviderClient):
         self._default = default_provider
         self._clients: dict[str, ProviderClient] = {}
         self._lock = threading.Lock()
+        # [中文] 当分发补全请求时触发的可选 callable(provider_name) 回调 —— 驱动“设置”面板中的“上次使用”行。
+        # 尽最大努力执行：其失败绝不会影响模型调用。
         # Optional callable(provider_name) fired when a completion is dispatched — drives the
         # Settings pane's "Last used" line. Best-effort: its failures never break a model call.
         self._on_use = on_use
@@ -46,7 +59,10 @@ class ProviderRouter(ProviderClient):
 
     # -- routing ----------------------------------------------------------------
     def _provider_name(self, model: str) -> str:
-        """The provider for a model: the `prefix` of `prefix:rest` if it's a known provider,
+        """[中文] 获取模型对应的提供商：如果是已知提供商，则为 `prefix:rest` 中的 `prefix`，
+        否则为默认提供商。（若冒号前不是已知的提供商 —— 极少见 —— 则回退默认处理）。
+
+        The provider for a model: the `prefix` of `prefix:rest` if it's a known provider,
         else the default. (A colon that isn't a known provider — unlikely — falls through.)
         """
         if ":" in model:
@@ -69,7 +85,11 @@ class ProviderRouter(ProviderClient):
 
     @staticmethod
     def _bare(model: str) -> str:
-        """Strip a KNOWN provider prefix; the underlying SDK wants the bare model name. A model
+        """[中文] 剔除已知的提供商前缀；底层 SDK 需要纯粹的模型名称。
+        若模型字符串的第一段不是提供商（例如 `qwen2.5-coder:32b` —— 冒号后是版本标签而非前缀），
+        则原样返回，避免将冒号误认为提供商分隔符。
+
+        Strip a KNOWN provider prefix; the underlying SDK wants the bare model name. A model
         whose first segment isn't a provider (e.g. `qwen2.5-coder:32b` — a version tag, not a
         prefix) is returned unchanged, so the colon isn't mistaken for a provider separator.
         """
@@ -80,7 +100,8 @@ class ProviderRouter(ProviderClient):
         return model
 
     def invalidate(self, name: Optional[str] = None) -> None:
-        """Drop cached client(s) so the next call rebuilds with fresh config."""
+        """[中文] 废弃已缓存的客户端，以便下一次调用使用最新配置重新构建。
+        Drop cached client(s) so the next call rebuilds with fresh config."""
         with self._lock:
             if name is None:
                 self._clients.clear()

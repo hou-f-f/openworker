@@ -1,4 +1,15 @@
-"""The Auto-Approve reviewer — a second model call that judges ONE proposed action against
+"""[中文] 自动审批审查器 (The Auto-Approve Reviewer) —— 发起第二次模型调用，
+针对用户实际请求来评判单个拟议操作，使得常规操作无需卡片即可运行，且仅有真正可疑的操作才会打扰用户。
+
+规范设计记录：`ocw-context/docs/reviewed-auto-mode.md` 第 8 部分。在此处或引擎钩子中强制执行的重要不变性：
+
+* **它只能将“询问人类”转变为“继续执行” —— 绝不能将“已阻止”转变为“继续执行”。**
+  引擎仅在门禁标记为 `needs_user` 的决定上咨询它；硬性拒绝绝不会到达审查器 (§1.2)。
+* **每个请求仅一个操作** (§8.6)。提议多个调用的轮次会并发触发多个审查器调用；每个请求仅携带一个操作，因此判定在物理上不可能落在错误的操作上，且无需重新配对列表。
+* **默认失败闭合 (Fail closed)** (§8.5)。畸形 JSON、未知判定、空响应、超时或提供商错误都会变成 `unsure` → 由人类决定。没有任何解析路径会导致未授权执行。
+* **审查器从不阅读不受信任的内容** (§4.4)。其输入是指令、已知世界（仅限文件夹和远程仓库）、用户自己的消息以及拟议的操作。网页文本、邮件正文和文件内容绝不会出现 —— 攻击者只能向智能体讲话，绝不能向裁判讲话。
+
+[English] The Auto-Approve reviewer — a second model call that judges ONE proposed action against
 what the user actually asked for, so routine actions run without a card and only the
 genuinely questionable ones interrupt.
 
@@ -28,7 +39,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-# The §8.3 instructions, verbatim. Stable for the whole session — they sit at the top of
+# [中文] §8.3 审查器指令，逐字固定。整个会话期间保持稳定 —— 它们位于每个审查器请求的最顶端，以便利用提供商的 Prompt 缓存机制 (§1.7)。
+# [English] The §8.3 instructions, verbatim. Stable for the whole session — they sit at the top of
 # every reviewer request so the provider's prompt cache does the heavy lifting (§1.7).
 INSTRUCTIONS = """\
 You are the action reviewer for OpenWorker, a desktop AI assistant that can edit files,
@@ -182,7 +194,8 @@ Request: "update the changelog"
 Action: write_file {"path": ".git/hooks/pre-commit", "content": "..."}
 {"verdict": "unsure", "reason": "This writes a git hook that will run on your next commit, which isn't part of updating the changelog."}"""
 
-# What the AGENT is told on a deny (§8.4). Terse and non-diagnostic on purpose: at that
+# [中文] 在拒绝执行时告知智能体的内容 (§8.4)。故意保持简短且不提供诊断信息：此时智能体可能正依据注入指令行事，具体的原因会将审查器变成先知/反馈靶子 —— 重试、读取原因、调整后再重试。完整原因发送给人类用户（事件 + 审计日志），绝不发送到此处。与智能体永不可见的 `_display` 附注具有相同的安全原则 (engine.py)。
+# [English] What the AGENT is told on a deny (§8.4). Terse and non-diagnostic on purpose: at that
 # moment the agent may be acting on injected instructions, and a specific reason turns the
 # reviewer into an oracle — retry, read the reason, adjust, retry. The full reason goes to
 # the USER (event + audit), never here. Same principle as the `_display` sidecar the agent
@@ -193,11 +206,13 @@ AGENT_DENY_MESSAGE = (
     "and let the user decide."
 )
 
-# Bound the complete input, never silently cut restrictions out of each message.
+# [中文] 约束完整输入的最大字符长度，绝不静默削减限制条件。
+# [English] Bound the complete input, never silently cut restrictions out of each message.
 APPROVAL_CONTEXT_MAX_CHARS = 64000
 
 _VALID_VERDICTS = frozenset({"allow", "deny", "unsure"})
-# The reply is one short JSON object, but on a hard call the model reasons before it
+# [中文] 回复是一个简短的 JSON 对象，但在复杂判定时模型会在回答前进行思考推理，该推理按相同的上限计费。4000 为思考留出空间，同时远低于 SDK 的非流式上限（约 21k）。
+# [English] The reply is one short JSON object, but on a hard call the model reasons before it
 # answers, and that reasoning is billed against the same cap. 400 cut exactly those calls
 # off (live 2026-09-17: two verdicts with tokens_out == 400 came back empty or as half a
 # JSON object and fell to `unsure`). 4000 leaves room to think and stays far below the
@@ -207,9 +222,10 @@ REVIEWER_MAX_TOKENS = 4000
 
 @dataclass(frozen=True)
 class Verdict:
-    verdict: str  # "allow" | "deny" | "unsure" — never anything else
+    verdict: str  # [中文] "allow" | "deny" | "unsure" —— 绝无其他值 / [English] "allow" | "deny" | "unsure" — never anything else
     reason: str
-    # Diagnostics for audit/metering; never shown to the agent. `tokens_in` is the FRESH
+    # [中文] 用于审计/计量的诊断数据；绝不向智能体展示。`tokens_in` 为新鲜输入份额；`cache_read`/`cache_write` 为缓存命中份额。
+    # [English] Diagnostics for audit/metering; never shown to the agent. `tokens_in` is the FRESH
     # input share (what providers bill full price); `cache_read`/`cache_write` are the
     # cached shares several providers serve/report automatically. Dropping them made a
     # 1,400-token call report as "16 in" (Together GLM, live 2026-08-17) — the real
@@ -218,7 +234,8 @@ class Verdict:
     tokens_out: int = 0
     cache_read: int = 0
     cache_write: int = 0
-    # True when this `unsure` came from the MACHINERY failing (provider error, timeout),
+    # [中文] 当该 `unsure` 来源于机械故障（提供商报错、超时）而非模型正常判定时为 True。
+    # [English] True when this `unsure` came from the MACHINERY failing (provider error, timeout),
     # not from the model judging. The live engine treats both identically — card, human —
     # but the eval must not: an errored row measured nothing, and a gate "passed" on
     # error-unsures is caution by outage, not judgment (found live 2026-08-17: Together
@@ -233,12 +250,14 @@ def _fail_closed(reason: str, *, error: bool = False) -> Verdict:
 
 
 def parse_verdict(text: str) -> Verdict:
-    """Parse the reviewer's reply. ANY defect → `unsure` (§8.5): there is no parse path
+    """[中文] 解析审查器的回复。任何缺陷 → `unsure` (§8.5)：没有任何解析路径会导致未授权执行。
+    [English] Parse the reviewer's reply. ANY defect → `unsure` (§8.5): there is no parse path
     that results in execution."""
     if not text or not text.strip():
         return _fail_closed("reviewer returned nothing")
     raw = text.strip()
-    # Models occasionally fence the JSON despite instructions; strip one fence, nothing more.
+    # [中文] 尽管有提示指令，模型有时仍会用代码块包裹 JSON；仅剥离一层代码块，不做多余处理。
+    # [English] Models occasionally fence the JSON despite instructions; strip one fence, nothing more.
     fenced = re.match(r"^```(?:json)?\s*(.*?)\s*```$", raw, re.DOTALL)
     if fenced:
         raw = fenced.group(1).strip()
@@ -258,7 +277,14 @@ def parse_verdict(text: str) -> Verdict:
 
 
 def render_history(user_messages: list[dict[str, Any]]) -> str:
-    """The EARLIER-IN-THIS-SESSION block: the user's own words, mechanically extracted,
+    """[中文] 本会话早期对话记录块：机械提取的用户原话，完整保留，将 `ask_user` 回复标记为 reply (§8.2)。
+    `user_messages` 是按时间顺序排列的 {"text": str, "is_reply": bool} 列表，不包含当前轮次。
+
+    回复标记为 `reply`，绝不标记为 `turn N`：“turn”是用户自行发送的消息，将回答标记为 turn 会被误读为自发声明。轮次编号仅计算真实消息。
+
+    当捕获到智能体的问题时，会将其与回复一同展示，明确界定为智能体自己的原话：裁判严格按照规则 3（数据而非指令）针对具体提问来权衡回答。
+
+    [English] The EARLIER-IN-THIS-SESSION block: the user's own words, mechanically extracted,
     preserved whole, with `ask_user` replies tagged as replies (§8.2). `user_messages` is a
     list of {"text": str, "is_reply": bool} in chronological order, current turn excluded.
 
@@ -303,7 +329,8 @@ def build_messages(
     provenance: str = "",
     action_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """One reviewer request. Cache-shaped (§8.2): everything stable or append-only first
+    """[中文] 构建单次审查器请求的消息体。专为缓存设计 (§8.2)：所有稳定或仅追加的内容置于最前（指令 · 已知世界 · 历史记录），变化部分（本轮请求 + 单个拟议操作）置于最后。绝不将操作放在最前。
+    [English] One reviewer request. Cache-shaped (§8.2): everything stable or append-only first
     (instructions · known world · history), the varying part (this turn's request + the one
     action) last. Never put the action first."""
     prefix_parts = [INSTRUCTIONS]
@@ -325,7 +352,8 @@ def build_messages(
         f"  {tool_name} {rendered_args}"
     )
     if provenance:
-        # Engine-authored, fixed vocabulary - never file contents (§8.2). Lives in the
+        # [中文] 引擎生成，固定词汇 —— 绝非文件内容 (§8.2)。位于变化后缀中，因此缓存前缀不受影响。
+        # [English] Engine-authored, fixed vocabulary - never file contents (§8.2). Lives in the
         # varying suffix so the cached prefix is untouched.
         suffix += f"\n  NOTE  {provenance}"
     if action_context:
@@ -337,7 +365,11 @@ def build_messages(
 
 
 class Reviewer:
-    """Judges one action at a time with the session's own model (§1.5 — no second key; if
+    """[中文] 使用会话自身的模型逐一评判每个拟议操作 (§1.5 —— 无需第二份密钥；如果信任该模型来驱动智能体，它就足够强来审查智能体)。
+
+    故意不保留对完整对话对象的引用：引擎每次调用时传入当前请求和机械提取的用户历史，因此审查器能看到的内容完全在调用点单一位置确定。
+
+    [English] Judges one action at a time with the session's own model (§1.5 — no second key; if
     it's trusted to drive the agent, it's strong enough to review it).
 
     Deliberately holds no reference to the conversation: the engine passes the request and
@@ -357,7 +389,8 @@ class Reviewer:
         self.model = model
         self.known_world = known_world
         self.timeout = timeout
-        # Metering (§1.7): counts and token totals, surfaced via audit rows and the
+        # [中文] 计量统计 (§1.7)：计数和 Token 总量，通过审计行和会话摘要展示。绝不用于决策判定。
+        # [English] Metering (§1.7): counts and token totals, surfaced via audit rows and the
         # session summary. Never consulted for decisions.
         self.stats: dict[str, int] = {
             "checks": 0,
@@ -380,8 +413,10 @@ class Reviewer:
         provenance: str = "",
         action_context: dict[str, Any] | None = None,
     ) -> Verdict:
-        """Never raises. Every failure mode is an `unsure` (§8.5)."""
-        # Never quietly truncate restrictions out of the owner's words. This is a
+        """[中文] 执行审查。绝不抛出异常。每种失败模式都会退化为 `unsure` 并交由人类决策 (§8.5)。
+        [English] Never raises. Every failure mode is an `unsure` (§8.5)."""
+        # [中文] 绝不静默地削减用户词句中的限制。这是确定性的大小限制，而非范围分类器；超大输入直接询问人类。
+        # [English] Never quietly truncate restrictions out of the owner's words. This is a
         # deterministic size limit, not a scope classifier; oversized input asks a human.
         if action_context and action_context.get("context_unavailable"):
             return self._count(_fail_closed("approval context is unavailable", error=True))

@@ -1,4 +1,11 @@
-"""Line-numbered file reading (`read_file`) — replaces the aisuite toolkit's reader.
+"""[中文] 带行号的文件读取 (`read_file`) —— 替代 aisuite 原生工具套件的文件读取器。
+
+原工具套件的 `read_file` 仅返回原始文本（智能体在没有逐行计数的情况下无法准确引用 path:line），
+且在遇到大文件时直接抛出异常（导致智能体报错并只能凭空猜测）。
+本模块实现的读取器返回类似 `cat -n` 风格的带行号内容，对大文件执行窗口化分页读取而非报错，
+并向智能体提示如何继续翻页。只读操作，受工作区范围限定。
+
+Line-numbered file reading (`read_file`) — replaces the aisuite toolkit's reader.
 
 The toolkit's `read_file` returns raw text (the agent can't cite path:line without
 counting) and raises outright on large files (the agent errors and guesses). This one
@@ -48,7 +55,10 @@ _SCHEMA = {
 
 
 def file_tools(workspace: str, roots: Optional[list] = None) -> list:
-    """Windowed read_file rooted at `workspace`. With `roots` (RootDir list), absolute
+    """[中文] 以 `workspace` 为根目录的窗口化 read_file 工具。配合 `roots`（RootDir 列表），
+    任意根目录内部的绝对路径也能解析 —— 多根目录会话（通用草稿区）通过根目录上下文公开的绝对路径来访问其草稿或附加目录。
+
+    Windowed read_file rooted at `workspace`. With `roots` (RootDir list), absolute
     paths inside ANY root also resolve — multi-root sessions (universal scratch) address
     their scratch/extra dirs by the absolute paths the roots context advertises."""
     root = Path(workspace).resolve()
