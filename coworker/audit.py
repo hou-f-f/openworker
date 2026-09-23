@@ -1,4 +1,5 @@
-"""Durable local audit log for connector/tool actions."""
+"""[中文] 连接器/工具操作的本地持久化审计日志。
+[English] Durable local audit log for connector/tool actions."""
 
 from __future__ import annotations
 
@@ -52,6 +53,9 @@ class AuditStore:
                 cache_write INTEGER DEFAULT 0
             )
             """)
+        # [中文] 既有数据库早于审核员列引入（2026-08-12）：call_id 将影子裁决与人类在同一工具调用上的决策关联起来，
+        # tokens_in/out 属于审核员计量指标（§1.7）。ALTER 依靠报错保证幂等性：“duplicate column” 表示已迁移的文件。
+        # [English]
         # Existing databases predate the reviewer columns (2026-08-12): call_id joins a
         # shadow verdict to the human's decision on the same tool call, tokens_in/out are
         # the reviewer metering (§1.7). ALTER is idempotent-by-error: "duplicate column"
@@ -60,6 +64,10 @@ class AuditStore:
             ("call_id", "TEXT"),
             ("tokens_in", "INTEGER DEFAULT 0"),
             ("tokens_out", "INTEGER DEFAULT 0"),
+            # [中文] 审核员检查中缓存前缀所占份额（2026-08-22）。若无此项，计量徽标将只能看到新鲜的全新 token
+            # — 一旦 Provider 缓存了指令前缀，每次约 1,500 token 的检查中仅有 ~75 个新鲜 token —
+            # 导致会话运行越久，成本低报越严重。与 OPE-101 属于同类缺陷，只是外了一层。
+            # [English]
             # Cached-prefix share of a reviewer check (2026-08-22). Without these the
             # metering badge could only ever see the FRESH tokens — ~75 of a ~1,500-token
             # check once the provider caches the instruction prefix — so it under-reported
@@ -67,6 +75,8 @@ class AuditStore:
             # layer further out.
             ("cache_read", "INTEGER DEFAULT 0"),
             ("cache_write", "INTEGER DEFAULT 0"),
+            # [中文] 组织下的设备群（2026-09-02）：此调用运行所在会话背后的已验证登录身份 — 本地/桌面或自动化会话为 ""。
+            # [English]
             # Fleet under the org (2026-09-02): the verified login behind the session
             # this call ran in — "" for local/desktop or automated sessions.
             ("actor", "TEXT DEFAULT ''"),
@@ -78,7 +88,9 @@ class AuditStore:
                 )
             except sqlite3.OperationalError:
                 pass  # column already exists
-        self._conn.commit()
+            self._conn.commit()
+        # [中文] 导出钩子（remote/audit_export.py）：在每次提交后、锁之外被调用，附带该行的 id — 发送方通过游标回读该行。
+        # [English]
         # Export hooks (remote/audit_export.py): told after every commit, outside the
         # lock, with the row's id — the emitter reads the row back by cursor.
         self._listeners: list[Any] = []
@@ -87,7 +99,8 @@ class AuditStore:
         self._listeners.append(callback)
 
     def list_since(self, after_id: int, *, limit: int = 200) -> list[dict[str, Any]]:
-        """Rows with id > after_id, OLDEST first — the export cursor's read."""
+        """[中文] id > after_id 的行，最旧的在前面 — 导出游标的读取方式。
+        [English] Rows with id > after_id, OLDEST first — the export cursor's read."""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM audit_events WHERE id > ? ORDER BY id ASC LIMIT ?",
@@ -145,10 +158,14 @@ class AuditStore:
             try:
                 cb(row_id)
             except Exception:
-                pass  # an export hook must never break the audited action
+                # [中文] 导出钩子绝不能破坏被审计的操作 / [English] an export hook must never break the audited action
+                pass
 
     def reviewer_stats(self, session_id: str) -> dict[str, Any]:
-        """Per-session Auto-Approve metering (§1.7), computed from the durable rows so it
+        """[中文] 每次会话的自动批准计量（§1.7），从持久行计算，因此在重启和引擎重建后仍能保留。
+        `live` 计算 stage=reviewer_verdict（实际执行决策的模式）；`shadow` 计算 stage=reviewer_shadow（仅记录）。
+
+        [English] Per-session Auto-Approve metering (§1.7), computed from the durable rows so it
         survives restarts and engine rebuilds. `live` counts stage=reviewer_verdict (the
         mode actually deciding); `shadow` counts stage=reviewer_shadow (recording only)."""
 

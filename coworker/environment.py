@@ -1,4 +1,11 @@
-"""Session environment context — injected into the system prompt at engine build.
+"""[中文] 会话环境上下文 —— 在引擎构建时注入到系统提示词中。
+
+通过提前告知智能体当前所在位置以及工作区的状态，在每个会话中为智能体节省 3-4 次环境发现工具调用
+（pwd、uname、git status、git log）。git 快照是时间点快照；提示词中已明确标注这一点，
+以便智能体在依赖该快照前重新检查。
+
+[English]
+Session environment context — injected into the system prompt at engine build.
 
 Saves the agent 3-4 discovery tool calls every session (pwd, uname, git status, git log)
 by telling it up front where it is and what state the workspace is in. The git snapshot is
@@ -55,7 +62,11 @@ def _git_snapshot(workspace: Path) -> list[str]:
 
 
 def environment_context(workspace: str | Path) -> str:
-    """A system-prompt block describing the session's environment and git state."""
+    """[中文] 描述会话环境与 Git 状态的系统提示词代码块。
+
+    [English]
+    A system-prompt block describing the session's environment and git state.
+    """
     ws = Path(workspace).expanduser().resolve()
     mac = _platform.mac_ver()[0]
     os_name = f"macOS {mac}" if mac else f"{_platform.system()} {_platform.release()}"

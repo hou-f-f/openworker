@@ -1,4 +1,27 @@
-"""The BoardDialect seam — where "a board" stops meaning "our SQLite file".
+"""[中文] BoardDialect 适配接口层 —— 将“看板”解耦于“本地 SQLite 文件”。
+
+方言（dialect）从客户端视角定义了记录看板（board of record）的物理存在位置：
+- LocalDialect：本机的 TeamStore/JournalStore，直接通过 SQLite 交互。
+  用于调用方为唯一写入者的独立/无头（standalone/headless）场景。
+- RemoteDialect：连接到运行在其他地方的看板的单一通信协议（`/v1/board` HTTP API）
+  —— 例如本机正在运行的 OpenWorker sidecar、队友的开发机，或将来的托管看板云服务。
+  身份凭据承载于 Token 中；服务端将其绑定到 actor+role，并由底层存储执行权限校验，因此远程客户端在架构上是天然安全的。
+
+外部工单系统（如 Jira / Linear）特意不作为方言实现：若将 pre-LLM 时代的老式工单系统作为
+权威记录看板，意味着我们必须将其 API 扭曲适配我们团队的状态机与交付游标机制。
+相反，它们以镜像（MIRRORS）的形式加入 —— 充当在仅追加事件日志上具有游标的又一个订阅者，
+将事件向外同步重放（于 2026-08-16 决议）。看板本身始终是抽象的核心与唯一真实数据源。
+
+所有入口 —— `team-board` MCP 服务器、`ocw` CLI、远程 OpenWorker 实例 ——
+最终都汇聚到这一个动词操作面上。方言实例在创建时即完成身份绑定：每个实例对应一个 actor，
+与外部运行环境的单进程单身份模型保持一致。
+
+跨进程写入安全：底层存储的哈希链追加采用在进程内锁保护下的“读取头节点再写入”机制，
+因此绝对禁止两个进程直接并发写入同一个 SQLite 文件。
+基本规则：当服务端运行时，所有客户端均走 remote 远程方言；LocalDialect 仅用于当前进程为唯一写入者的无头场景。
+
+[English]
+The BoardDialect seam — where "a board" stops meaning "our SQLite file".
 
 A dialect is where the board of record LIVES, seen from a client's chair:
 - LocalDialect: this machine's TeamStore/JournalStore, direct SQLite. For the
@@ -36,7 +59,7 @@ from .store import TeamStore
 
 
 class BoardDialect(Protocol):
-    """The verb surface a board client sees, identity already bound."""
+    """[中文] 看板客户端所看到的动词操作面，身份已预先绑定。 / [English] The verb surface a board client sees, identity already bound."""
 
     def whoami(self) -> dict[str, Any]: ...
     def spaces(self) -> list[str]: ...
@@ -92,7 +115,7 @@ class BoardDialect(Protocol):
         caption: str = "",
     ) -> dict[str, Any]: ...
     def attachment(self, space: str, stored: str) -> tuple[bytes, str]:
-        """Read a blob referenced by an actor-visible item in ``space``."""
+        """[中文] 读取在 ``space`` 中对该 actor 可见的看板事项所引用的 blob 数据。 / [English] Read a blob referenced by an actor-visible item in ``space``."""
         ...
     def policy(self, space: str) -> dict[str, Any]: ...
     def set_policy(self, space: str, *, claims: str) -> dict[str, Any]: ...
@@ -124,7 +147,7 @@ class BoardDialect(Protocol):
 
 
 class LocalDialect:
-    """Direct store access, one bound identity. The headless/standalone backing."""
+    """[中文] 直接访问底层存储，绑定单一身份。无头/独立场景的后端实现。 / [English] Direct store access, one bound identity. The headless/standalone backing."""
 
     def __init__(
         self,
@@ -228,7 +251,8 @@ class LocalDialect:
         *,
         caption: str = "",
     ) -> dict[str, Any]:
-        # Attach = store blob + an attributed attachment-comment event. Comment
+        # [中文] 附加 = 存储 blob + 产生一个带属性归属的 attachment-comment 评论事件。评论权限即是附加权限（worker 仅能在自己被分配的分片上附加）。
+        # [English] Attach = store blob + an attributed attachment-comment event. Comment
         # authority IS attach authority (workers attach on their slice only).
         if self.attachments is None:
             raise BoardError("no attachment store is attached to this board")
@@ -317,7 +341,11 @@ class LocalDialect:
 
 
 class RemoteDialect:
-    """The `/v1/board` HTTP client. `base_url` is an OpenWorker sidecar or a hosted
+    """[中文] `/v1/board` HTTP 客户端。`base_url` 是 OpenWorker sidecar 或托管的看板服务；
+    Bearer 令牌携带身份 —— 服务端将其解析为 actor+role，因此该客户端从不需要主动宣称自己是谁，而是通过令牌自证。
+
+    [English]
+    The `/v1/board` HTTP client. `base_url` is an OpenWorker sidecar or a hosted
     board service; the Bearer token carries identity — the server resolves it to an
     actor+role, so this client never states who it is, it proves it."""
 
@@ -333,7 +361,7 @@ class RemoteDialect:
         )
         self._client.headers["Authorization"] = f"Bearer {token}"
 
-    # -- plumbing --------------------------------------------------------------
+    # -- [中文] 底层网络通信 / [English] plumbing --------------------------------------------------------------
 
     def _get(self, path: str, params: Optional[dict] = None) -> Any:
         response = self._client.get(
@@ -362,7 +390,7 @@ class RemoteDialect:
             )
         return data
 
-    # -- verbs -----------------------------------------------------------------
+    # -- [中文] 动词操作 / [English] verbs -----------------------------------------------------------------
 
     def whoami(self) -> dict[str, Any]:
         return self._get("/v1/board/whoami")
@@ -569,7 +597,11 @@ class RemoteDialect:
 def local_dialect(
     db_dir, *, actor: str = "user", role: str = "user"
 ) -> LocalDialect:
-    """Open the state dir's stores directly as one bound identity — the headless
+    """[中文] 直接打开 state 目录下的底层存储并绑定单一身份 —— 当没有 OpenWorker 服务端运行时，
+    为 CLI 和 MCP 服务器提供无头支持。
+
+    [English]
+    Open the state dir's stores directly as one bound identity — the headless
     backing for the CLI and MCP server when no OpenWorker server is running."""
     from pathlib import Path
 

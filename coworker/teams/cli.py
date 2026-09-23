@@ -1,4 +1,23 @@
-"""`ocw` — the board and journal from any shell, for any harness.
+"""[中文] `ocw` —— 适用于任何 Shell、面向任何框架的团队看板与知识日志 CLI 命令行工具。
+
+看板是一个开放的操作界面（OPE-100）：提供与应用内智能体相同的角色作用域动词，
+可供外部智能体 CLI、自动化脚本或人类操作员使用。
+可将其指向正在运行的 OpenWorker 服务器（本机或远程），或直接指向本地 state 状态目录。
+
+底层存储解析顺序（优先级从高到低）：
+1. `--url` + `--token`（或环境变量 OCW_BOARD_URL / OCW_BOARD_TOKEN）—— 远程看板。
+2. `--db DIR` —— 直接访问指定 state 目录中的 SQLite 数据库（无头模式；你必须是唯一的写入者）。
+3. 正在运行的本地服务器，通过其按端口生成的 sidecar token 文件发现 —— CLI 会在首次使用时
+   为自身签发一个本地 user 令牌。只要有服务器处于运行状态，此方式优先于直接访问 SQLite：
+   绝对禁止两个进程同时写入同一个看板文件。
+4. 默认 state 目录上的直接 SQLite 访问（无其他程序运行）。
+
+`ocw board mcp` 在 stdio 上将相同的看板功能作为 MCP 服务器对外提供 —— 这是将看板
+接入外部编码智能体（如 Cursor、Cline 等）的标准途径：将智能体的 MCP 配置指向
+`ocw board mcp --url … --token … --space …` 并提示其领取任务事项。
+
+[English]
+`ocw` — the board and journal from any shell, for any harness.
 
 The board is an open surface (OPE-100): the same role-scoped verbs the in-app
 agents get, usable by an external agent CLI, a script, or a human. Point it at a
@@ -121,7 +140,8 @@ def _parser() -> argparse.ArgumentParser:
 
     cmd("spaces", _cmd_spaces, "list known board spaces")
 
-    # `token` manages the serving machine's registry file directly — it takes no
+    # [中文] `token` 命令直接管理服务端机器上的注册表文件 —— 它不需要底层/身份标志参数（因为 mint 本身就是创建身份的操作）。
+    # [English] `token` manages the serving machine's registry file directly — it takes no
     # backing/identity flags of its own (minting is what CREATES identities).
     p = board_sub.add_parser(
         "token", help="mint/list/revoke board join tokens (serving machine)"
@@ -182,7 +202,7 @@ def _backing_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--json", action="store_true", help="machine-readable output")
 
 
-# ------------------------------------------------------------------ backing
+# ------------------------------------------------------------------ [中文] 后端解析 / [English] backing
 
 
 def _space(args) -> str:
@@ -207,7 +227,7 @@ def _dialect(args):
 
 
 def _discover_server() -> Optional[str]:
-    """A running local server, found via its per-port sidecar token files."""
+    """[中文] 运行中的本地服务器，通过其按端口生成的 sidecar token 文件进行发现。 / [English] A running local server, found via its per-port sidecar token files."""
     import httpx
 
     from ..secrets import state_dir
@@ -232,7 +252,11 @@ def _discover_server() -> Optional[str]:
 
 
 def _local_cli_token() -> str:
-    """The CLI's own user token against the local server. Minted once into the
+    """[中文] CLI 访问本地服务器的专用 user 令牌。在共享注册表中一次性签发；
+    明文以仅限当前用户权限缓存于 state 目录中 —— 这是用户在自己机器上的凭证，与 sidecar token 文件的机制一致。
+
+    [English]
+    The CLI's own user token against the local server. Minted once into the
     shared registry; the plaintext is cached user-only in the state dir — the
     user's own credential on the user's own machine, same pattern as the sidecar
     token file."""
@@ -253,7 +277,7 @@ def _local_cli_token() -> str:
     return token
 
 
-# ------------------------------------------------------------------ board cmds
+# ------------------------------------------------------------------ [中文] 看板命令 / [English] board cmds
 
 
 def _cmd_list(args) -> int:
@@ -461,7 +485,7 @@ def _cmd_mcp(args) -> int:
     return 0
 
 
-# ------------------------------------------------------------------ journal cmds
+# ------------------------------------------------------------------ [中文] 日志命令 / [English] journal cmds
 
 
 def _cmd_cases(args) -> int:

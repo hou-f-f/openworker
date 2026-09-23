@@ -1,4 +1,7 @@
-"""Read-only Team View projections. Never a wake source or an agent transcript tool."""
+"""[中文] 团队视图（Team View）的只读聚合投影。绝不会作为唤醒源或模型对话历史工具。
+
+[English]
+Read-only Team View projections. Never a wake source or an agent transcript tool."""
 
 from __future__ import annotations
 
@@ -12,6 +15,8 @@ from .store import ITEM_STATUS, WORKER_WAITING
 KINDS = ("input", "cache_read", "output", "cache_write")
 
 
+# [中文] 安全地将时间戳数值或 ISO 格式字符串转换为 UNIX 时间戳浮点数
+# [English] Safely convert timestamp number or ISO string to UNIX timestamp float
 def stamp(value) -> float:
     try:
         number = (
@@ -24,6 +29,8 @@ def stamp(value) -> float:
         return 0.0
 
 
+# [中文] 规范化提取 token 用量（input, cache_read, output, cache_write）
+# [English] Normalize token usage extraction (input, cache_read, output, cache_write)
 def tokens(usage) -> dict:
     result = {}
     for key in KINDS:
@@ -34,12 +41,17 @@ def tokens(usage) -> dict:
     return result
 
 
+# [中文] 聚合多个用量记录中各维度的 token 总数
+# [English] Sum token usage across multiple rows by token kind
 def add_tokens(rows) -> dict:
     return {key: sum(row.get(key, 0) for row in rows) for key in KINDS}
 
 
 def compact_usage_points(points, buckets=120):
-    """Bound the optional chart payload, preserving every recorded token by role."""
+    """[中文] 压缩图表点位数据量上限，按角色保留所有记录的 token 消耗。
+
+    [English]
+    Bound the optional chart payload, preserving every recorded token by role."""
     points = sorted(points, key=lambda p: p["ts"])
     if len(points) <= buckets:
         return points
@@ -62,7 +74,10 @@ def compact_usage_points(points, buckets=120):
 
 
 def all_events(store, space):
-    """Read every page, not just the first 500 events of a long-running team."""
+    """[中文] 分页读取全部事件，而非仅读取长期运行团队的前 500 个事件。
+
+    [English]
+    Read every page, not just the first 500 events of a long-running team."""
     cursor = 0
     while True:
         page = store.events(space, since_seq=cursor, limit=2000)
@@ -72,6 +87,8 @@ def all_events(store, space):
         cursor = page[-1]["seq"]
 
 
+# [中文] 查找因审批或人工反馈而处于等待状态的事项映射
+# [English] Find items waiting on approvals or human input
 def waiting_items(events, inbox, items):
     current = {i["id"]: i for i in items}
     result = {}
@@ -99,7 +116,10 @@ def waiting_items(events, inbox, items):
 
 
 def breakdown(intervals, start, end):
-    """Partition wall time; overlapping parallel calls count once, not N times."""
+    """[中文] 划分自然流逝时间段；重叠的并行调用只计算一次，而非累计 N 次。
+
+    [English]
+    Partition wall time; overlapping parallel calls count once, not N times."""
     clipped = [
         (max(start, a), min(end, b), kind)
         for a, b, kind in intervals
@@ -120,7 +140,10 @@ def breakdown(intervals, start, end):
 
 
 def active_windows(events, end):
-    """Assignment to review/done, including rework; no inference from prose."""
+    """[中文] 计算从任务分配到评审/完成的活跃时间窗口，包括返工；不对纯文本内容做主观推断。
+
+    [English]
+    Assignment to review/done, including rework; no inference from prose."""
     windows, start, actor = [], None, ""
     for event in events:
         ts = stamp(event["ts"])
@@ -140,6 +163,8 @@ def active_windows(events, end):
     return windows
 
 
+# [中文] 聚合计算团队状态摘要：包含看板事项状态、工作量/时间耗时划分、Token 消耗统计、待审批请求与图表点位
+# [English] Aggregate team summary: board item status, timing breakdown, token usage, pending asks, and chart points
 def make_summary(manager, team, now):
     board = manager.session_board(team.lead_session)
     events = list(all_events(manager.team_store, team.space))

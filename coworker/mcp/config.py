@@ -1,4 +1,14 @@
-"""MCP server config — the standard `mcpServers` JSON, layered global + workspace.
+"""[中文] MCP 服务器配置 —— 标准的 `mcpServers` JSON，采用全局 + 工作区分层机制。
+
+全局配置：  ~/.config/coworker/mcp.json
+工作区配置：<workspace>/.coworker/mcp.json   （在名称冲突时覆盖全局，
+            但仅在用户信任该工作区后生效 —— 与代码仓库 `allowed_commands` 的安全门控一致）
+
+格式与 Claude Desktop / Cursor / Codex 粘贴兼容。command/args/env/url/headers 中的 `${VAR}`
+引用在加载时通过 SecretStore 解析（包含系统环境变量 + 本地 `.env`）。REST 编辑操作的目标是**全局**配置文件。
+
+[English]
+MCP server config — the standard `mcpServers` JSON, layered global + workspace.
 
 Global:    ~/.config/coworker/mcp.json
 Workspace: <workspace>/.coworker/mcp.json   (overrides global on name clash,
@@ -36,7 +46,9 @@ class MCPServerDef:
     include_tools: Optional[list[str]] = None
     exclude_tools: Optional[list[str]] = None
     requires_approval: bool = True
-    # "oauth" → browser OAuth 2.1 + PKCE with Dynamic Client Registration (mcp/oauth.py).
+    # [中文] "oauth" → 具备动态客户端注册（DCR）的浏览器端 OAuth 2.1 + PKCE（参见 mcp/oauth.py）。
+    # 仅适用于 HTTP 传输；令牌保存在 SecretStore 中，绝不保存在本配置文件中。
+    # [English] "oauth" → browser OAuth 2.1 + PKCE with Dynamic Client Registration (mcp/oauth.py).
     # HTTP transport only; tokens live in the SecretStore, never in this file.
     auth: Optional[str] = None
 
@@ -55,7 +67,11 @@ def _read(path: Path) -> dict[str, Any]:
 def _config_paths(
     workspace: Optional[str | Path], *, workspace_trusted: bool
 ) -> list[Path]:
-    """Config files to merge. Workspace MCP is executable provenance (stdio spawn),
+    """[中文] 待合并的配置文件路径列表。工作区 MCP 属于可执行文件来源（stdio 进程派生），
+    因此不受信任的仓库的 `.coworker/mcp.json` 绝不会被读取 —— 仅凭克隆代码绝不能定义在会话开启时运行的进程。
+
+    [English]
+    Config files to merge. Workspace MCP is executable provenance (stdio spawn),
     so an untrusted repo's `.coworker/mcp.json` is never read — cloning alone must
     not be enough to define processes that run at session open.
     """
@@ -66,7 +82,7 @@ def _config_paths(
 
 
 def _parse(name: str, raw: dict[str, Any], secrets: SecretStore) -> MCPServerDef:
-    raw = secrets.resolve(raw)  # resolve ${VAR} everywhere before building the def
+    raw = secrets.resolve(raw)  # [中文] 在构建 server def 之前在各处解析 ${VAR} / [English] resolve ${VAR} everywhere before building the def
     declared = str(raw.get("type", "")).lower()
     is_http = declared in _HTTP_TYPES or bool(raw.get("url"))
     return MCPServerDef(
@@ -92,7 +108,15 @@ def load_mcp_servers(
     secrets: Optional[SecretStore] = None,
     workspace_trusted: bool = False,
 ) -> list[MCPServerDef]:
-    """Merge global + (when trusted) workspace `mcpServers` into parsed server defs.
+    """[中文] 将全局与（受信任时的）工作区 `mcpServers` 合并为解析后的服务器定义列表。
+
+    仅有受信任的工作区才会参与合并 —— 这与代码仓库 ``allowed_commands`` 属于相同的许可边界 ——
+    并且**在命名冲突时全局配置胜出**，因此即使是受信任的代码仓库也无法通过复用全局名称来静默重定义全局服务器。
+    工作区定义中的 ``${VAR}`` 引用从用户的环境变量中解析，这之所以被允许完全是因为该工作区已被信任；
+    不受信任的工作区绝不会被读取。
+
+    [English]
+    Merge global + (when trusted) workspace `mcpServers` into parsed server defs.
 
     Only trusted workspaces contribute — the same consent boundary as repository
     ``allowed_commands`` — and **global wins on name clash**, so even a trusted repo
@@ -105,13 +129,13 @@ def load_mcp_servers(
     for path in _config_paths(workspace, workspace_trusted=workspace_trusted):
         for name, raw in (_read(path).get("mcpServers") or {}).items():
             if isinstance(raw, dict):
-                merged.setdefault(name, raw)  # global first → global wins on clash
+                merged.setdefault(name, raw)  # [中文] 先加载全局 → 冲突时全局配置生效 / [English] global first → global wins on clash
     return [_parse(name, raw, secrets) for name, raw in merged.items()]
 
 
-# -- raw global-file mutation (REST) -------------------------------------------
+# -- [中文] 原始全局文件变更操作（REST 接口） / [English] raw global-file mutation (REST) -----------
 def read_global() -> dict[str, dict[str, Any]]:
-    """Raw `mcpServers` map from the global file (no `${VAR}` resolution)."""
+    """[中文] 来自全局配置文件的原始 `mcpServers` 映射表（未解析 `${VAR}`）。 / [English] Raw `mcpServers` map from the global file (no `${VAR}` resolution)."""
     return dict(_read(global_mcp_path()).get("mcpServers") or {})
 
 
@@ -134,7 +158,8 @@ def patch_global_server(name: str, changes: dict[str, Any]) -> bool:
     if name not in servers:
         return False
     merged = {**servers[name], **changes}
-    # A None value DELETES the key (there is no other way to remove one through a
+    # [中文] None 值用于删除该键（在 merge patch 中没有其他删除键的方法）—— 由 OPE-136 信任迁移用于丢弃 `requires_approval`。
+    # [English] A None value DELETES the key (there is no other way to remove one through a
     # merge patch) — used by the OPE-136 trust migration to drop `requires_approval`.
     servers[name] = {k: v for k, v in merged.items() if v is not None}
     _write_global(servers)

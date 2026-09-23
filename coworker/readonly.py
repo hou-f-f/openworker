@@ -1,4 +1,20 @@
-"""Conservative read-only shell-command classifier for the session-scoped grant.
+"""[中文] 用于会话作用域授权的保守只读 Shell 命令分类器。
+
+“允许本会话执行只读命令”（2026-08-11 负责人需求，源于安全扫描会话中的审批疲劳：每次运行需手动审批约 15 次）
+仅当本分类器接受该命令时才自动允许。该契约规定：
+
+- **仅限本地文件系统读取。** 网络客户端（curl/wget/ssh/nc）被特意排除，即使是 GET 请求也不允许 —
+  在 Prompt 注入攻击下，自动允许的网络命令就是数据外泄通道。解释器（python/ruby/sh -c）以及任何可写入、
+  执行或修改的操作均被排除。
+- **允许管道操作**（`nl … | sed -n … | grep …`）— 其中的每个阶段都必须通过分类。
+  所有其他 Shell 操作符（;, &&, ||, &, 重定向, 命令替换）均被直接拒绝。
+- **故障闭合（Fail closed）。** 未知命令、无法解析的输入、通过路径调用的二进制文件以及任何存疑的标志都会被拒绝。
+  假阴性（误拒）的代价是一次手动审批；假阳性（误放）的代价是一次未受审查的副作用 — 这里的每个边缘情况都由这种不对称性决定。
+
+这是建立在审批流程之上的用户可选便利功能，而非沙箱：会话仍在自身的权限模式下运行，且用户显式授予了该作用域。
+
+[English]
+Conservative read-only shell-command classifier for the session-scoped grant.
 
 "Allow read-only commands for this session" (owner ask 2026-08-11, born of approval
 fatigue in security-scan sessions: ~15 hand-approvals per run) auto-allows a command only
@@ -24,7 +40,8 @@ from __future__ import annotations
 import re
 import shlex
 
-# Commands that only read local state, with no writing flags to police.
+# [中文] 仅读取本地状态且无需防范写入标志的安全命令。
+# [English] Commands that only read local state, with no writing flags to police.
 _SIMPLE_SAFE = {
     "ls", "cat", "head", "tail", "wc", "nl", "sort", "uniq", "cut", "tr",
     "grep", "egrep", "fgrep", "rg", "ugrep", "file", "stat", "du", "df",
@@ -34,6 +51,8 @@ _SIMPLE_SAFE = {
     "hexdump", "xxd", "od", "true", "false", "yamllint", "actionlint",
 }
 
+# [中文] 仅读取的 Git 子命令。注意下方的每子命令防范 — 若干 git “读取”命令会通过特定标志演变为写入/执行行为。
+# [English]
 # Git subcommands that only read. Note the per-subcommand guards below — several git
 # "read" commands grow write/exec behavior through specific flags.
 _GIT_SAFE = {
@@ -51,6 +70,8 @@ _FIND_BAD = ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fls",
 
 _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=[^;&|<>`]*$")
 
+# [中文] 调用 `w`/`W`（写文件）命令的 sed 脚本标记：在起始处、分隔符后或地址后。保守处理 — 误伤仅仅意味着一次手动审批。
+# [English]
 # A sed script token that invokes the `w`/`W` (write-file) command: at the start, after a
 # separator, or after an address. Conservative — a false hit just means one manual approval.
 _SED_WRITE = re.compile(r"(^|[;{])\s*[0-9,$/ ]*[wW]\s")
@@ -74,7 +95,8 @@ def _has_unquoted_shell_variable(command: str) -> bool:
 
 
 def _stages(command: str) -> list[list[str]] | None:
-    """Tokenize with operators surfaced; split into pipeline stages. None = reject."""
+    """[中文] 保留操作符进行分词；拆分为管道各个阶段。返回 None 表示拒绝。
+    [English] Tokenize with operators surfaced; split into pipeline stages. None = reject."""
     if not command or not command.strip():
         return None
     # Shell variables are expanded after this check; single-quoted '$' is literal.
@@ -100,6 +122,8 @@ def _stages(command: str) -> list[list[str]] | None:
 
 
 def _git_ok(args: list[str]) -> bool:
+    # [中文] 全局标志：仅 `-C <dir>` 和 `--no-pager` 放行；`-c`/`--config-env` 可以设置 core.pager 及类似执行钩子 — 予以拒绝。
+    # [English]
     # Global flags: only `-C <dir>` and `--no-pager` pass; `-c`/`--config-env` can set
     # core.pager and similar exec hooks — rejected.
     i = 0
@@ -115,7 +139,7 @@ def _git_ok(args: list[str]) -> bool:
         return False
     sub, rest = args[i], args[i + 1 :]
     if any(t.startswith("--output") for t in rest):
-        return False  # git log/diff --output=<file> writes
+        return False  # [中文] git log/diff --output=<file> 会写入文件 / [English] git log/diff --output=<file> writes
     if sub in _GIT_SAFE:
         return True
     if sub == "branch":
@@ -136,6 +160,8 @@ def _git_ok(args: list[str]) -> bool:
 
 
 def _stage_ok(argv: list[str]) -> bool:
+    # [中文] 前导 VAR=value 赋值（例如 LC_ALL=C grep …）是惰性的 — 跳过它们。
+    # [English]
     # Leading VAR=value assignments (LC_ALL=C grep …) are inert — skip them.
     i = 0
     while i < len(argv) and _ENV_ASSIGN.match(argv[i]):
@@ -145,12 +171,12 @@ def _stage_ok(argv: list[str]) -> bool:
         return False
     head = argv[0]
     if "/" in head:
-        return False  # path-invoked binaries can be anything; bare names only
+        return False  # [中文] 通过路径调用的二进制文件可能是任何程序；仅限纯命令名 / [English] path-invoked binaries can be anything; bare names only
     args = argv[1:]
     if head in _SIMPLE_SAFE:
         return True
     if head == "env":
-        return not args  # bare `env` prints; `env CMD` executes
+        return not args  # [中文] 单独的 `env` 仅打印；`env CMD` 会执行命令 / [English] bare `env` prints; `env CMD` executes
     if head == "command":
         return bool(args) and args[0] in {"-v", "-V"}
     if head == "git":
@@ -167,14 +193,21 @@ def _stage_ok(argv: list[str]) -> bool:
 
 
 def is_readonly_command(command: str) -> bool:
-    """True iff `command` is a single command or pure pipeline of local read-only stages."""
+    """[中文] 当且仅当 `command` 是单个命令或纯粹由本地只读阶段组成的管道时为 True。
+    [English] True iff `command` is a single command or pure pipeline of local read-only stages."""
     stages = _stages(str(command or ""))
     if stages is None:
         return False
     return all(_stage_ok(s) for s in stages)
 
 
-# -- read targets (OPE-130) ------------------------------------------------------------
+# -- [中文] 读取目标（OPE-130） / [English] read targets (OPE-130) ------------------------------------------------------------
+# [中文] 上述分类器决定命令可以“做什么”。它对命令可以“读取什么”只字未提，因此旨在“不要再询问我的项目文件”的会话授权
+# 同时也覆盖了 ~/.aws/credentials、~/.ssh/id_rsa 以及 OpenWorker 自身的 secrets 文件。这些辅助函数解析出文件操作数，
+# 以便调用方将其限制在会话的根目录下 — 与 OPE-122 中针对浏览器上传的修复形式相同。
+#
+# 从任意 Shell 中提取读取目标通常是不可能的；在此处之所以可行，仅因为分类器已将输入缩小为上述动词。
+# [English]
 # The classifier above decides what a command may DO. It says nothing about what the
 # command may READ, so a session grant meant for "stop asking about my project files" also
 # covered ~/.aws/credentials, ~/.ssh/id_rsa and OpenWorker's own secrets file. These
@@ -199,7 +232,8 @@ _NUMERIC = re.compile(r"^[0-9]+([,:.-][0-9]+)*[a-zA-Z]?$")
 
 
 def _stage_targets(argv: list[str]) -> list[str]:
-    """File operands of one accepted pipeline stage."""
+    """[中文] 单个已被接受的管道阶段的文件操作数。
+    [English] File operands of one accepted pipeline stage."""
     i = 0
     while i < len(argv) and _ENV_ASSIGN.match(argv[i]):
         i += 1
@@ -252,7 +286,15 @@ def _stage_targets(argv: list[str]) -> list[str]:
 
 
 def read_targets(command: str) -> list[str]:
-    """Every file operand `command` would read, for scoping against the session's roots.
+    """[中文] `command` 将要读取的每个文件操作数，用于对照会话根目录进行范围限定。
+
+    仅对 `is_readonly_command` 所接受的命令有意义 — 它假定已经过审查。
+    宁可多列出操作数：多一个的代价是一次手动审批，少一个则是一次无范围限定的读取，
+    该不对称性决定了此处的边缘情况，正如上文所述。
+
+    已知限制：通过此表未列出的标志所触及的路径不会返回。携带真实风险的位置操作数均已覆盖。
+
+    [English] Every file operand `command` would read, for scoping against the session's roots.
 
     Only meaningful for commands `is_readonly_command` accepts — it assumes that vetting.
     Errs toward naming MORE operands: an extra one costs a manual approval, a missed one

@@ -1,4 +1,9 @@
-"""MCP integration — our own async client on the official `mcp` SDK.
+"""[中文] MCP 集成 —— 基于官方 `mcp` SDK 构建的自主异步客户端。
+
+公共 API：配置加载/变更、连接管理器以及工具包装。
+
+[English]
+MCP integration — our own async client on the official `mcp` SDK.
 
 Public API: config loading/mutation, the connection manager, and tool wrapping.
 """

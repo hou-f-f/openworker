@@ -1,4 +1,9 @@
-"""Agent-facing scheduling tools (Cowork + MyHelper).
+"""[中文] 面向智能体的调度工具（Cowork + MyHelper）。
+
+`create_scheduled_task` 设有门禁保护（`requires_approval`），因此在创建常驻自动化之前会先弹出确认卡片（在创建时审批）。智能体自行将自然语言（“每天晚上7:10”）转换为 cron 字符串。工具与发起源绑定：创建的任务记录发起会话并在其工作区中运行，以便原始对话可以读取结果（产物是该文件夹中的实际文件）。
+
+[English]
+Agent-facing scheduling tools (Cowork + MyHelper).
 
 `create_scheduled_task` is gated (`requires_approval`) so it surfaces a confirm card before a
 standing automation is created (approve-at-creation). The agent converts natural language
@@ -134,6 +139,8 @@ _LIST_SCHEMA = {
 }
 
 
+# [中文] 为工具函数绑定 Schema 元数据与审批关卡标记
+# [English] Bind schema metadata and approval gate flags to tool function
 def _gated(func: Callable, schema: dict, *, approval: bool) -> Callable:
     func.__name__ = schema["function"]["name"]
     func.__doc__ = schema["function"]["description"]
@@ -148,12 +155,16 @@ def _gated(func: Callable, schema: dict, *, approval: bool) -> Callable:
     return func
 
 
+# [中文] 构建并返回面向智能体的调度工具集（创建、列举、更新、删除任务）
+# [English] Construct and return agent-facing scheduling tools (create, list, update, delete tasks)
 def scheduling_tools(
     store: TaskStore,
     *,
     origin: dict[str, Any],
     default_workspace: str,
 ) -> list[Callable[..., Any]]:
+    # [中文] 创建定时自动化任务（需人工确认批准）
+    # [English] Create a scheduled automation task (requires human approval)
     def create_scheduled_task(
         title, instructions, cron=None, fire_at=None, timezone="local", permissions=None
     ):
@@ -172,6 +183,9 @@ def scheduling_tools(
             timezone=timezone or "local",
         )
         workspace = origin.get("workspace") or default_workspace
+        # [中文] 智能体提议权限；用户通过批准此受控调用进行授权（许可卡片展示该提案）。
+        # 仅已验证的写权限生效：工具必须声明目标参数（绝非执行/破坏性工具），且目标非空。
+        # [English]
         # The agent PROPOSES permissions; the human granted them by approving this gated
         # call (the consent card rendered the proposal). Only validated write grants stick:
         # tool must declare a target argument (never exec/destructive), target non-empty.
@@ -197,9 +211,13 @@ def scheduling_tools(
             "always_allowed": grants,
         }
 
+    # [中文] 列举所有定时任务（公开元数据）
+    # [English] List all scheduled tasks (public metadata)
     def list_scheduled_tasks():
         return {"tasks": [t.public() for t in store.list()]}
 
+    # [中文] 更新定时任务状态或属性（需人工确认批准）
+    # [English] Update scheduled task status or properties (requires human approval)
     def update_scheduled_task(
         id, enabled=None, instructions=None, cron=None, title=None
     ):
@@ -222,6 +240,8 @@ def scheduling_tools(
         store.save(task)
         return {"ok": True, "task": task.public()}
 
+    # [中文] 删除定时任务及其运行历史（需人工确认批准）
+    # [English] Delete scheduled task and its run history (requires human approval)
     def delete_scheduled_task(id):
         return {"ok": store.delete(id), "id": id}
 

@@ -1,6 +1,11 @@
-"""Agent teams substrate. Two append-only stores, one record discipline:
+"""[中文] 智能体团队基础底层。两个仅追加存储，统一的记录准则：
+Board 看板日志（空间作用域 —— 看板随团队生死）以及 Journal 日志存储（按 Case 案件键控 —— 跨越看板和团队的持久知识）。
+
+[English]
+Agent teams substrate. Two append-only stores, one record discipline:
 the board log (space-scoped — a board lives and dies with its team) and the
-journal store (case-keyed — knowledge that outlives boards and teams)."""
+journal store (case-keyed — knowledge that outlives boards and teams).
+"""
 
 from .journal import JournalStore
 from .model import (
@@ -29,6 +34,8 @@ __all__ = [
     "journal_tools",
 ]
 
-# BoardDialect / LocalDialect / RemoteDialect live in .dialect, BoardTokens in
+# [中文] BoardDialect / LocalDialect / RemoteDialect 位于 .dialect 中，BoardTokens 位于 .tokens 中
+# —— 由各自的使用者（CLI、MCP 服务器、`/v1/board`）直接导入，以保持本包根目录轻量化，优化应用内的常见路径。
+# [English] BoardDialect / LocalDialect / RemoteDialect live in .dialect, BoardTokens in
 # .tokens — imported directly by their consumers (CLI, MCP server, `/v1/board`)
 # to keep this package root light for the common in-app path.

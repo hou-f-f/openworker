@@ -1,4 +1,10 @@
-"""User-owned trust decisions for repository-provided command allowances.
+"""[中文] 用户针对代码仓库提供的命令许可的信任决策。
+
+代码仓库可以在 `.coworker/config.toml` 中声明命令前缀，但这些授权仅在用户信任该确切的规范工作区根目录后生效。
+信任跟随路径本身而非配置的快照：在受信任路径下的未来更改都会被接受，直到用户撤销信任。
+
+[English]
+User-owned trust decisions for repository-provided command allowances.
 
 A repository may declare command prefixes in `.coworker/config.toml`, but those grants
 take effect only after the user trusts that exact canonical workspace root. Trust follows

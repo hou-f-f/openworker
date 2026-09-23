@@ -1,3 +1,8 @@
+"""[中文] 智能体持久化记忆模块（全局/工作区记忆、规则设置、SQLite 存储与工具）。
+
+[English]
+Agent persistent memory module (global/workspace memories, rules, SQLite store, and tools)."""
+
 from .base import (
     INDEX_THRESHOLD_CHARS,
     MemoryItem,

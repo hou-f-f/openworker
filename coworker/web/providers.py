@@ -1,4 +1,11 @@
-"""Web search providers — a keyless default + pluggable third-party services.
+"""[中文] Web 搜索提供方 —— 无需 key 的默认提供方 + 可插拔的第三方服务。
+
+`duckduckgo` 无需任何 API key 即可工作（我们自主打造的“开箱即用版本”）。
+`tavily` 与 `brave` 可提供更高质量的搜索结果，但需要 API key（通过 SecretStore 或环境变量配置）。
+所有提供方均返回统一格式的 `list[SearchResult]`；庞大的第三方客户端库均采用延迟导入（lazy-imported）。
+
+[English]
+Web search providers — a keyless default + pluggable third-party services.
 
 `duckduckgo` works with no API key (our "starting version of our own"). `tavily` and `brave`
 give better results but need a key (configured via the SecretStore / env). All providers
@@ -33,7 +40,7 @@ class WebSearchProvider(ABC):
 
 
 class DuckDuckGoProvider(WebSearchProvider):
-    """Keyless default via the `ddgs` library."""
+    """[中文] 基于 `ddgs` 库的无需 API key 的默认提供方。 / [English] Keyless default via the `ddgs` library."""
 
     name = "duckduckgo"
     requires_key = False

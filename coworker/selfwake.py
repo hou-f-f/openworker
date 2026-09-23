@@ -1,4 +1,12 @@
-"""Self-wake — tools that let a long-running agent suspend and be re-invoked on a trigger.
+"""[中文] 自唤醒（Self-wake）— 允许长期运行的 Agent 挂起并在触发器到达时被重新唤醒调用的工具。
+
+将常驻运行的 Agent 转换为挂起/恢复模型（事件驱动，几乎零空闲成本）：会话进入休眠，
+当唤醒到期时运行时环境重新调用它。这里支持两种触发器：**定时器**（`sleep_for` 相对等待，`sleep_until` 绝对时间）
+和**任务完成触发**（针对后台任务的 `wake_on`）。该模块拥有唤醒记录及到期/完成逻辑；调度器 tick 消费 ``due()`` /
+``complete_job()`` 并恢复会话（与自动化调度器共享 — 参见 ``PERMISSIONS-AND-INBOX.md``）。
+
+[English]
+Self-wake — tools that let a long-running agent suspend and be re-invoked on a trigger.
 
 Converts an always-on agent into suspend/resume (event-driven, ~zero idle cost): the session
 sleeps and the runtime re-invokes it when a wake is due. Two triggers here: a **timer**
@@ -21,7 +29,7 @@ from typing import Optional
 
 KIND_TIMER = "timer"
 KIND_COMPLETION = "completion"
-KIND_EVENT = "event"  # wake when a named connector/webhook event fires (Phase 3)
+KIND_EVENT = "event"  # [中文] 当命名的连接器/Webhook 事件触发时唤醒（第 3 阶段） / [English] wake when a named connector/webhook event fires (Phase 3)
 
 STATE_PENDING = "pending"
 STATE_DUE = "due"
@@ -39,9 +47,9 @@ class Wake:
     session_id: str
     kind: str
     state: str = STATE_PENDING
-    fire_at: Optional[str] = None  # ISO, for timer wakes
-    job_id: Optional[str] = None  # for completion wakes
-    event_key: Optional[str] = None  # for on-event wakes
+    fire_at: Optional[str] = None  # [中文] ISO 格式时间字符串，用于定时器唤醒 / [English] ISO, for timer wakes
+    job_id: Optional[str] = None  # [中文] 用于任务完成唤醒 / [English] for completion wakes
+    event_key: Optional[str] = None  # [中文] 用于事件触发唤醒 / [English] for on-event wakes
     note: str = ""
     created_at: str = field(default_factory=lambda: _now().isoformat())
     cancellation_reason: str = ""
@@ -60,6 +68,8 @@ class WakeStore:
             for raw in saved.get("wakes", []):
                 w = Wake(**raw)
                 self._wakes[w.id] = w
+            # [中文] 旧版本会累积定时器。每个会话仅保留最新的挂起 sleep，同时保留被替换的记录以供审计。
+            # [English]
             # Older versions accumulated timers. Keep only the newest pending
             # sleep per session while retaining the replaced records for audit.
             newest = {}
@@ -130,7 +140,8 @@ class WakeStore:
         return w
 
     def due(self, now: Optional[datetime] = None) -> list[Wake]:
-        """Timer wakes whose fire time has passed, plus completion/event wakes marked due."""
+        """[中文] 触发时间已过的定时器唤醒，加上被标记为到期的任务完成/事件唤醒。
+        [English] Timer wakes whose fire time has passed, plus completion/event wakes marked due."""
         now = now or _now()
         out = []
         with self._lock:
@@ -149,13 +160,15 @@ class WakeStore:
         return out
 
     def complete_job(self, job_id: str) -> list[Wake]:
-        """Mark completion wakes for ``job_id`` as due (the job exited). Returns them."""
+        """[中文] 将针对 ``job_id`` 的完成唤醒标记为到期（任务已退出）。返回这些唤醒。
+        [English] Mark completion wakes for ``job_id`` as due (the job exited). Returns them."""
         return self._mark_due(
             lambda w: w.kind == KIND_COMPLETION and w.job_id == job_id
         )
 
     def fire_event(self, event_key: str) -> list[Wake]:
-        """Mark on-event wakes for ``event_key`` as due (a connector/webhook fired). Returns them."""
+        """[中文] 将针对 ``event_key`` 的事件唤醒标记为到期（连接器/Webhook 触发）。返回这些唤醒。
+        [English] Mark on-event wakes for ``event_key`` as due (a connector/webhook fired). Returns them."""
         return self._mark_due(
             lambda w: w.kind == KIND_EVENT and w.event_key == event_key
         )
@@ -179,7 +192,8 @@ class WakeStore:
                 self._save()
 
     def cancel_sleep(self, session_id: str, reason: str) -> None:
-        """Retain cancelled reminders durably until an incoming turn records them."""
+        """[中文] 持久保留已取消的提醒，直到入站轮次将其记录下来。
+        [English] Retain cancelled reminders durably until an incoming turn records them."""
         with self._lock:
             changed = False
             for w in self._wakes.values():
@@ -208,7 +222,8 @@ class WakeStore:
             ]
 
     def acknowledge(self, wake_ids: list[str]) -> None:
-        """Called only after a durable incoming-message receipt exists."""
+        """[中文] 仅在持久化入站消息收据存在之后调用。
+        [English] Called only after a durable incoming-message receipt exists."""
         with self._lock:
             changed = False
             for wake_id in wake_ids:
@@ -232,10 +247,15 @@ class WakeStore:
 
 
 def selfwake_tools(store: WakeStore, session_id: str) -> list:
-    """Tools an agent calls to schedule its own resumption."""
+    """[中文] Agent 用来调度自身恢复运行的工具集合。
+    [English] Tools an agent calls to schedule its own resumption."""
 
     def sleep_for(seconds: int, note: str = "") -> dict:
-        """Suspend and wake this session after `seconds` (a relative wait: "check again in
+        """[中文] 挂起并在 `seconds` 秒后唤醒此会话（相对等待：“5 分钟后再检查”为 sleep_for(300)）。
+        用于显式的定时检查，而非常规团队轮询：看板决策会自动唤醒结束了本轮运行的 Lead。
+        替换先前的 sleep。更早的看板/用户活动会取消它，并将其可选提醒便签带入后续活动。无需时钟计算。
+
+        [English] Suspend and wake this session after `seconds` (a relative wait: "check again in
         5 minutes" is sleep_for(300)). Use for an explicit timed check, not routine
         team polling: board decisions already wake a lead that finishes its turn.
         Replaces the previous sleep. Earlier board/user activity cancels
@@ -247,7 +267,12 @@ def selfwake_tools(store: WakeStore, session_id: str) -> list:
         return {"ok": True, "wake_id": w.id, "fire_at": w.fire_at}
 
     def sleep_until(when_iso: str, note: str = "") -> dict:
-        """Suspend and wake this session at an ISO-8601 timestamp (timezone-aware; bare
+        """[中文] 挂起并在 ISO-8601 时间戳处唤醒此会话（感知时区；无时区的时间戳被视为 UTC）—
+        用于绝对时间（“明天 09:00”）。如果需要今天的日期或时区，请先调用 `current_time`；对于相对等待，
+        请改用 sleep_for。替换先前的 sleep，并在更早的看板/用户活动中取消，将可选提醒便签带入该活动中。
+        这是一个空闲签到截止时间，而非持久预约。
+
+        [English] Suspend and wake this session at an ISO-8601 timestamp (timezone-aware; bare
         timestamps are read as UTC) — for an absolute time ("at 09:00 tomorrow"). Call
         `current_time` first if you need today's date or the timezone; for a relative wait
         use sleep_for instead. Replaces the previous sleep and cancels on earlier
@@ -260,12 +285,14 @@ def selfwake_tools(store: WakeStore, session_id: str) -> list:
         return {"ok": True, "wake_id": w.id, "fire_at": w.fire_at}
 
     def wake_on(job_id: str, note: str = "") -> dict:
-        """Suspend and wake this session when a backgrounded job (`job_id`) completes."""
+        """[中文] 当后台任务（`job_id`）完成时挂起并唤醒此会话。
+        [English] Suspend and wake this session when a backgrounded job (`job_id`) completes."""
         w = store.add_completion(session_id, job_id, note=note)
         return {"ok": True, "wake_id": w.id, "job_id": job_id}
 
     def wake_on_event(event_key: str, note: str = "") -> dict:
-        """Suspend and wake this session when a named event (`event_key`) fires — e.g. a
+        """[中文] 当命名事件（`event_key`）触发时挂起并唤醒此会话 — 例如 Ops Agent 监控的连接器/Webhook 信号。
+        [English] Suspend and wake this session when a named event (`event_key`) fires — e.g. a
         connector/webhook signal an Ops agent watches for."""
         w = store.add_event(session_id, event_key, note=note)
         return {"ok": True, "wake_id": w.id, "event_key": event_key}

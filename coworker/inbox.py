@@ -1,4 +1,20 @@
-"""The durable wait queue for prompts — NOT the Inbox surface.
+"""[中文] 提示的持久化等待队列 — **而非** Inbox 界面。
+
+命名缘由（2026-09-05 负责人裁定）：本模块与 ``InboxStore`` 是**持久化等待队列**：
+会话在等待人类时搁置的每个提示（审批、问题、文件夹/计划/人员配备/连接器门控）作为条目存在于此，
+因此它在 Socket 断开或重启后依然存活，并可从任何界面作答。可将其视为 ``DurableWaitQueue``。
+用户看到的 *Inbox* 是另一回事：仅显示 ``visibility`` 为 ``inbox`` 条目的跨会话列表 —
+会话仅在用户将其设置为无人值守（Unattended）时才具有此属性。
+有人值守会话的条目为 ``inline``：它们在该会话中呈现为卡片，绝不会出现在 Inbox 中。
+编写涉及此代码的内容时，请使用“搁置提示并等待”，切勿使用“发送至 Inbox”；Inbox 仅仅是无人值守表盘。
+（类名和模块名保留一个版本 — 重命名会触及每个界面 — 但新代码不应扩散旧名称。）
+
+条目状态机（防竞态契约）：每个条目为 ``pending → resolved``，仅解析**一次**，
+具备幂等性且先响应者获胜 — 因此从任何界面（应用内、Slack、恢复后的输入框）作答均安全。
+``inbox_approver`` 将权限请求转换为条目，并挂起 Agent 直至该条目得到解析。
+
+[English]
+The durable wait queue for prompts — NOT the Inbox surface.
 
 NAMING (owner ruling 2026-09-05): this module and ``InboxStore`` are the **durable wait
 queue**: every prompt a session parks while it waits for a human — an approval, a
@@ -32,14 +48,17 @@ from typing import Any, Optional
 KIND_APPROVAL = "approval"
 KIND_QUESTION = "question"
 KIND_NOTIFICATION = "notification"
-KIND_DIRECTORY = "directory"  # agent asks to be granted a folder
-KIND_PLAN = "plan"  # agent presents a plan for approval
-KIND_TOOL = "tool"  # agent asks for a missing CLI tool to be installed
-KIND_CONNECTOR = "connector"  # §11.6: connect a service / grant a worker a connector
+KIND_DIRECTORY = "directory"  # [中文] Agent 请求授予文件夹权限 / [English] agent asks to be granted a folder
+KIND_PLAN = "plan"  # [中文] Agent 提交计划以供审批 / [English] agent presents a plan for approval
+KIND_TOOL = "tool"  # [中文] Agent 请求安装缺失的 CLI 工具 / [English] agent asks for a missing CLI tool to be installed
+KIND_CONNECTOR = "connector"  # [中文] §11.6：连接服务 / 授予 Worker 连接器权限 / [English] §11.6: connect a service / grant a worker a connector
 
 STATE_PENDING = "pending"
 STATE_RESOLVED = "resolved"
 
+# [中文] 挂起提示呈现的位置。INLINE = 有人值守的会话在输入区回答（服务端搁置，重连时重新下发，绝不出现在的跨会话列表中）。
+# INBOX = 用户将会话设置为无人值守，因此加入跨会话 Inbox 队列。无论是哪种，都是相同的被搁置、可等待、从任意处解析的记录 — 仅可见性不同。
+# [English]
 # Where a pending prompt surfaces. INLINE = an attended session answers it in the composer (parked
 # server-side, redelivered on reconnect, never in the cross-session list). INBOX = the user set the
 # session Unattended, so it joins the cross-session Inbox queue. Either way it's the same parked,
@@ -53,7 +72,8 @@ def _now() -> str:
 
 
 def args_preview(arguments: Optional[dict], *, limit: int = 240) -> str:
-    """A compact one-line summary of a tool call's arguments, for an approval card body (so a
+    """[中文] 工具调用参数的紧凑单行摘要，用于审批卡片正文（使得镜像的“运行 `write_file`？”展示具体内容 — 路径/内容 — 而不仅仅是工具名称）。
+    [English] A compact one-line summary of a tool call's arguments, for an approval card body (so a
     mirrored 'Run `write_file`?' shows *what* — path/content — not just the tool name).
     """
     parts: list[str] = []
@@ -76,33 +96,46 @@ class InboxItem:
     body: str = ""
     state: str = STATE_PENDING
     resolution: Optional[str] = (
-        None  # approval: "allow"/"deny"/"always"; question: answer text
+        None  # [中文] 审批："allow"/"deny"/"always"；问题：回答文本 / [English] approval: "allow"/"deny"/"always"; question: answer text
     )
-    inbox: str = "default"  # named inbox / delivery binding (Phase 3 routing)
+    inbox: str = "default"  # [中文] 命名 inbox / 投递绑定（第 3 阶段路由） / [English] named inbox / delivery binding (Phase 3 routing)
     created_at: str = field(default_factory=_now)
     resolved_at: Optional[str] = None
+    # [中文] 谁解决了它（答案来自云端时为控制器验证的登录身份；实时应用内回答为会话的 actor；未知/本地为 ""）。
+    # [English]
     # Who resolved it (controller-verified login when the answer came through the cloud;
     # the session's actor for a live in-app answer; "" when unknown/local).
     resolved_by: str = ""
-    visibility: str = VIS_INBOX  # inline (attended) vs inbox (unattended)
+    visibility: str = VIS_INBOX  # [中文] inline（有人值守）对比 inbox（无人值守） / [English] inline (attended) vs inbox (unattended)
+    # [中文] 此提示所阻塞的工具调用（持久化恢复：持久化以使重启能重建挂起状态并继续轮次）。使条目通过 (session_id, tool_call_id) 实现幂等。
+    # [English]
     # The tool call this prompt is blocking (durable resume: persisted so a restart can rebuild the
     # suspension and continue the turn). Makes an item idempotent by (session_id, tool_call_id).
     tool_call_id: Optional[str] = None
+    # [中文] 问题元数据（ask_user）：可选的快速回复选项 + 自由文本逃逸，映射 Claude Code 的 AskUserQuestion 结构化但始终可回答的形式。
+    # 选项可以是纯字符串或富 {label, description, recommended, preview} 对象（OPE-51）；旧的持久化条目保存字符串并保持有效。
+    # [English]
     # Question metadata (ask_user): optional quick-reply choices + a free-text escape, mirroring
     # the structured-but-always-answerable shape of Claude Code's AskUserQuestion.
     # An option is a plain string OR a rich {label, description, recommended, preview} object
     # (OPE-51); old persisted items hold strings and stay valid.
     options: list = field(default_factory=list)
     allow_text: bool = (
-        True  # accept a typed answer even when options exist (the "Other" escape)
+        True  # [中文] 即使存在选项也接受键入的回答（"Other" 逃逸选项） / [English] accept a typed answer even when options exist (the "Other" escape)
     )
-    multi: bool = False  # allow choosing more than one option
-    header: str = ""  # short chip label for the card ("Region")
+    multi: bool = False  # [中文] 允许选择多个选项 / [English] allow choosing more than one option
+    header: str = ""  # [中文] 卡片的简短 chip 标签（"Region"） / [English] short chip label for the card ("Region")
+    # [中文] 分组形式（OPE-51）：最多 4 个 {question, header, options, allow_text, multi} 条目渲染为分步向导（stepper）。
+    # 当非空时，上述单独的 title/options 字段仍保存第一个问题（以便旧界面和频道镜像降级为合理的表现），
+    # 解析结果是以 header 或 question 为键的 JSON 对象字符串。
+    # [English]
     # Grouped form (OPE-51): up to 4 {question, header, options, allow_text, multi} entries
     # rendered as a stepper. When non-empty the singular title/options fields above still hold
     # the FIRST question (so old surfaces and channel mirrors degrade to something sensible),
     # and the resolution is a JSON object string keyed by header-or-question.
     questions: list[dict] = field(default_factory=list)
+    # [中文] 针对特定类型的负载（directory：建议的路径/可写性；plan：计划文本；…）。
+    # [English]
     # Kind-specific payload (directory: suggested path/writable; plan: the plan text; …).
     data: dict[str, Any] = field(default_factory=dict)
 
@@ -151,6 +184,9 @@ class InboxStore:
         questions=None,
         tool_call_id: Optional[str] = None,
     ) -> InboxItem:
+        # [中文] 通过 (session_id, tool_call_id) 实现幂等：持久化恢复重新抛出相同的提示时，
+        # 必须复用现有的（可能已被解析的）条目，而不是重新提示。
+        # [English]
         # Idempotent by (session_id, tool_call_id): a durable resume re-raises the same prompt, and
         # must reuse the existing (possibly already-resolved) item rather than re-prompt.
         if tool_call_id:
@@ -199,6 +235,9 @@ class InboxStore:
         data=None,
         tool_call_id=None,
     ) -> InboxItem:
+        # [中文] `data` 携带长期作用域审批的自动化运行上下文（§25）：
+        # {task_id, task_title, standing_target?} — 应用内卡片的“每次都允许”门控。
+        # [English]
         # `data` carries the automation-run context for standing scoped approvals (§25):
         # {task_id, task_title, standing_target?} — the in-app card's "Allow every time" gate.
         return self.add(
@@ -347,7 +386,8 @@ class InboxStore:
         return self._items.get(item_id)
 
     def resolver_of(self, session_id: str, tool_call_id: str) -> str:
-        """Who resolved the item gating this tool call ("" if none/unknown)."""
+        """[中文] 门控此工具调用的条目的解决者（无/未知时为 ""）。
+        [English] Who resolved the item gating this tool call ("" if none/unknown)."""
         if not tool_call_id:
             return ""
         for item in self._items.values():
@@ -396,7 +436,11 @@ class InboxStore:
             }
 
     def resolve(self, item_id: str, resolution: str, by: str = "") -> bool:
-        """Resolve an item exactly once. First responder wins; later attempts are no-ops
+        """[中文] 恰好解析一个条目一次。先响应者获胜；后续尝试为空操作（返回 False）。
+        触发任何正在等待的 Agent（挂起的 inbox_approver）。
+        `by` = 谁作出的决定（规范 §Fleet under the org：被此条目门控的工具调用的审计行盖戳为 `approved_by`）。
+
+        [English] Resolve an item exactly once. First responder wins; later attempts are no-ops
         (return False). Fires any awaiting agent (the suspended inbox_approver).
         `by` = who decided (spec §Fleet under the org: the audit row of the tool call
         this item gated is stamped `approved_by` from it)."""
@@ -409,6 +453,9 @@ class InboxStore:
             source_id = item.data.get("worker_prompt_id")
             source = self._items.get(source_id) if isinstance(source_id, str) else None
             args = item.data.get("arguments") or {}
+            # [中文] 仅限服务端盖戳的所有权链接。拒绝“允许 Worker 行动”的权限意味着拒绝该行动，而不是使其无限期挂起。
+            # 绝不能将提议的拒绝反转为允许，或传播停止/删除/错误。
+            # [English]
             # Server-stamped ownership link only. Denying permission to ALLOW a worker
             # action means deny that action, not leave it parked indefinitely. Never
             # invert a proposed denial into an allow, or propagate stop/delete/errors.
@@ -438,7 +485,10 @@ class InboxStore:
     def resolve_session(
         self, session_id: str, resolution: str = "session deleted"
     ) -> int:
-        """Resolve every still-pending item of a session (called when the session is deleted —
+        """[中文] 解析会话中所有仍处于挂起状态的条目（在会话被删除时调用 — 孤儿审批/问题永远无法得到有意义的回答）。
+        以常规方式释放所有等待者；返回关闭的条目数。
+
+        [English] Resolve every still-pending item of a session (called when the session is deleted —
         an orphaned approval/question can never be meaningfully answered). Releases any waiter
         the usual way; returns how many items were closed."""
         closed = 0
@@ -448,7 +498,8 @@ class InboxStore:
         return closed
 
     async def wait(self, item_id: str) -> str:
-        """Await an item's resolution; returns the resolution string. Used by the approver to
+        """[中文] 等待条目的解析；返回解析结果字符串。由 approver 用于挂起 Agent，直到人类从任意界面作答。
+        [English] Await an item's resolution; returns the resolution string. Used by the approver to
         suspend the agent until a human answers (from any surface)."""
         with self._lock:
             item = self._items.get(item_id)
@@ -461,7 +512,12 @@ class InboxStore:
         return (resolved.resolution if resolved else "") or ""
 
     def promote_to_inbox(self, session_id: str) -> list[InboxItem]:
-        """Flip a session's still-pending INLINE prompts to Inbox visibility. Called when
+        """[中文] 将会话中仍挂起的 INLINE 提示翻转为 Inbox 可见性。在有人值守会话的最后一位实时查看者断开连接时调用：
+        inline 条目仅在该会话内部显示，因此在无人查看时 Agent 会隐式等待
+        （2026-09-01 卡死故障 — 通过实时路径提出的问题，Socket 断开，轮次被搁置直到引擎重建才重新抛出）。
+        提升后的条目出现在跨会话 Inbox 中（并镜像到绑定的频道），同时在会话重新打开时依然可以在会话内作答。返回发生变化的条目。
+
+        [English] Flip a session's still-pending INLINE prompts to Inbox visibility. Called when
         the last live viewer of an attended session disconnects: an inline item shows only
         inside that session, so with nobody watching it the agent would wait invisibly
         (the 2026-09-01 stall — a question asked over the live path, socket dropped, turn
@@ -480,7 +536,10 @@ class InboxStore:
 
     # -- resume reconciliation --------------------------------------------------
     def reconcile_on_resume(self, session_id: str) -> dict:
-        """When a user resumes attended control, surface this session's still-pending items
+        """[中文] 当用户恢复有人值守控制时，在会话内呈现此会话仍挂起的条目（从此在一个地方作答），
+        外加离开期间已答复内容的概览。单一事实来源：每个条目已经有一个权威的解析结果。
+
+        [English] When a user resumes attended control, surface this session's still-pending items
         inline (one place to answer from now on) plus a recap of what was answered while away.
         Single source of truth: every item already has one authoritative resolution."""
         pending = self.pending(session_id)
@@ -493,7 +552,10 @@ class InboxStore:
 
 # -- approver routing -----------------------------------------------------------
 def inbox_approver(store: InboxStore, session_id: str, *, inbox: str = "default"):
-    """An Approver that routes a permission request to the Inbox and suspends until resolved.
+    """[中文] 将权限请求路由到 Inbox 并挂起直到得到解析的 Approver。
+    将解析结果映射到 ApprovalOutcome（allow → ONCE，always → ALWAYS_TOOL，否则为 DENY）。
+
+    [English] An Approver that routes a permission request to the Inbox and suspends until resolved.
     Maps the resolution to an ApprovalOutcome (allow → ONCE, always → ALWAYS_TOOL, else DENY).
     """
     from .engine import ApprovalOutcome, PermissionRequest

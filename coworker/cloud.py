@@ -1,4 +1,14 @@
-"""OpenWorker Cloud client: sign-in and managed one-click connectors.
+"""[中文] OpenWorker Cloud 客户端：用户登录与托管的一键式连接器（Managed Connectors）。
+
+此处所有功能均为可选（OPTIONAL）。未登录状态下应用功能完全正常 —— 每个连接器均支持手动粘贴 Token（登录后该功能依然保留）。Cloud 登录仅解锁一键式托管 OAuth 流程以及附带的元数据便利。
+
+流程（移植自 opencoworker-cloud 中经过验证的 `ocw_cli` 参考实现）：
+- 登录：Auth0 授权码 + PKCE。Sidecar 生成 PKCE 密钥对，浏览器完成登录，Auth0 重定向至 Sidecar 的本地回环 `GET /auth/callback`，并在本地完成授权码交换。Cloud 会话 Token 保存在 SecretStore 的 `cloud:auth` 项下。
+- 托管连接：经过认证的 `POST /v1/oauth/{provider}/start` 返回提供商授权 URL；Broker 回调页面以 form-POST 方式将 Token 负载发送至 Sidecar 的本地回环 `POST /oauth/callback`；配置项写入本地。连接器 Token 绝不触碰云端存储。
+- 刷新：托管配置（包含 refresh_token + connection_id）在即将过期前通过 Broker 自动续期；手动配置绝不触动。
+
+[English]
+OpenWorker Cloud client: sign-in and managed one-click connectors.
 
 Everything here is OPTIONAL. The app is fully functional signed out — manual
 token paste stays available for every connector (and remains available after
@@ -39,7 +49,8 @@ LOGIN_SCOPES = "openid profile email offline_access"
 
 from . import __version__ as APP_VERSION  # noqa: E402
 
-# connector id (canonical, = descriptor name) -> broker provider key
+# [中文] 连接器 ID（规范名称，等于描述符名称）-> Broker 提供商标识键
+# [English] connector id (canonical, = descriptor name) -> broker provider key
 PROVIDER_FOR_CONNECTOR = {
     "gmail": "google",
     "google_calendar": "google",
@@ -52,16 +63,22 @@ PROVIDER_FOR_CONNECTOR = {
     "outlook": "microsoft",
 }
 
+# [中文] 按 OAuth state 索引的待处理 PKCE verifier；仅保存在进程内存中。如果登录会话跨越了 Sidecar 进程重启，只需重新发起登录即可。
+# [English]
 # Pending PKCE verifiers keyed by OAuth state; in-process only. A login that
 # outlives the sidecar process simply has to be restarted.
 _pending_logins: dict[str, dict[str, float | str]] = {}
 _PENDING_TTL = 600
+# [中文] 每个待处理的托管连接记录其启动时间以及（可选的）授权的目标机器 —— 回调据此记录进行路由。
+# [English]
 # Each pending managed connect records when it started and (optionally) which
 # machine the grant is destined for — the callback routes on that record.
 _pending_managed_states: dict[str, dict[str, Any]] = {}
 _MANAGED_STATE_TTL = 600
 
 
+# [中文] 将字节数组转换为不带补位 '=' 的 URL 安全 Base64 字符串
+# [English] Convert bytes to unpadded URL-safe Base64 string
 def _b64url(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
@@ -74,7 +91,12 @@ def _now() -> float:
 
 
 def begin_login(config: Config) -> dict[str, Any]:
-    """Create a PKCE login and return the browser URL. The sidecar's
+    """[中文] 创建 PKCE 登录流程并返回浏览器授权 URL。Sidecar 的 GET /auth/callback 将完成后续流程。
+
+    重定向经过 Broker 的稳定回调地址，Broker 再将浏览器跳转回实际绑定的回环端口（在 state 的 `.port` 后缀中传递 —— Auth0 会原样回显 state）。在打包的应用中直接使用本地回环重定向是行不通的：Auth0 的白名单会拒绝未注册的端口，而桌面外壳会为 Sidecar 绑定一个随机空闲端口。
+
+    [English]
+    Create a PKCE login and return the browser URL. The sidecar's
     GET /auth/callback completes it.
 
     The redirect goes through the BROKER's stable callback, which bounces the
@@ -113,6 +135,8 @@ def begin_login(config: Config) -> dict[str, Any]:
     return {"authorize_url": authorize_url, "state": state}
 
 
+# [中文] 完成 PKCE 授权码交换并将 Cloud 令牌持久化到 SecretStore
+# [English] Complete PKCE code exchange and persist cloud tokens to SecretStore
 def complete_login(
     secrets: SecretStore, config: Config, code: str, state: str
 ) -> dict[str, Any]:
@@ -155,7 +179,12 @@ def complete_login(
 
 
 def sync_connections(secrets: SecretStore, config: Config) -> dict[str, Any]:
-    """Rebuild local managed-connection state from the broker's metadata rows
+    """[中文] 云端登录后，从 Broker 的元数据行（GET /v1/connections）重建本地托管连接状态。
+
+    在全新安装时，仅 GitHub 可以完全自动恢复：其记录行仅为路由元数据（installation ID 与登录名），安装 Token 是按需动态生成的 —— 本地无需保存任何机密。按设计，所有其他连接器的 Token 仅保存在本地，因此需要进行一键重新授权。
+
+    [English]
+    Rebuild local managed-connection state from the broker's metadata rows
     (GET /v1/connections) after a cloud sign-in.
 
     Only GitHub restores fully on a fresh install: its rows are routing metadata
@@ -203,6 +232,8 @@ def sync_connections(secrets: SecretStore, config: Config) -> dict[str, Any]:
     return {"ok": True, "restored": restored}
 
 
+# [中文] 将 Cloud 访问令牌与刷新令牌持久化到 SecretStore
+# [English] Persist cloud access and refresh tokens to SecretStore
 def _store_cloud_tokens(secrets: SecretStore, token: dict) -> None:
     profile = secrets.get(CLOUD_AUTH_PROFILE) or {"type": "oauth", "enabled": True}
     profile["access_token"] = token.get("access_token", "")
@@ -212,6 +243,8 @@ def _store_cloud_tokens(secrets: SecretStore, token: dict) -> None:
     secrets.put(CLOUD_AUTH_PROFILE, profile)
 
 
+# [中文] 查询 Cloud 登录状态（是否已登录、账号邮箱、用户 ID）
+# [English] Query cloud sign-in status (signed-in flag, account email, user ID)
 def status(secrets: SecretStore) -> dict[str, Any]:
     profile = secrets.get(CLOUD_AUTH_PROFILE) or {}
     return {
@@ -221,13 +254,18 @@ def status(secrets: SecretStore) -> dict[str, Any]:
     }
 
 
+# [中文] 登出 Cloud 并清除本地存储的认证凭据
+# [English] Log out from cloud and remove local auth credentials
 def logout(secrets: SecretStore) -> dict[str, Any]:
     secrets.delete(CLOUD_AUTH_PROFILE)
     return {"ok": True, "signed_in": False}
 
 
 def fresh_access_token(secrets: SecretStore, config: Config) -> Optional[str]:
-    """Valid cloud session token, silently refreshed near expiry; None when
+    """[中文] 获取有效的 Cloud 会话 Token，临近过期时静默刷新；未登录或无法续期时返回 None（GUI 提示“请重新登录”）。
+
+    [English]
+    Valid cloud session token, silently refreshed near expiry; None when
     signed out or the session can't be renewed (GUI shows "sign in again")."""
     profile = secrets.get(CLOUD_AUTH_PROFILE) or {}
     if not profile.get("access_token"):
@@ -251,6 +289,8 @@ def fresh_access_token(secrets: SecretStore, config: Config) -> Optional[str]:
     return (secrets.get(CLOUD_AUTH_PROFILE) or {}).get("access_token")
 
 
+# [中文] 获取当前登录用户的个人信息
+# [English] Fetch profile of currently authenticated user
 def fetch_me(secrets: SecretStore, config: Config) -> Optional[dict]:
     token = fresh_access_token(secrets, config)
     if not token:
@@ -267,6 +307,11 @@ def fetch_me(secrets: SecretStore, config: Config) -> Optional[dict]:
 
 
 # --- telemetry (Phase 5) ---------------------------------------------------------
+# [中文] 遥测统计（Phase 5）：
+# 仅记录一句话：启动了哪种类型的 Coworker 以及启动时间 —— 无任何其他内容。
+# 仅限已登录用户，默认开启且提供退出选项；未登录用户（或选择退出者）不发送任何数据。
+# 绝不发送：会话标题、Prompt 内容、输出结果、工具参数、文件路径、连接器数据。
+# [English]
 # One sentence: which coworker type was started and when — nothing else. Signed-in
 # users only, default-on with an opt-out; signed out (or opted out) sends NOTHING.
 # Never sent: titles, prompts, outputs, tool args, file paths, connector content.
@@ -275,7 +320,10 @@ TELEMETRY_PROFILE = "cloud:telemetry"
 
 
 def install_id(secrets: SecretStore) -> str:
-    """Stable random per-install id, minted on first use (spec Phase 5)."""
+    """[中文] 稳定的随机安装实例 ID，在首次使用时生成（spec Phase 5）。
+
+    [English]
+    Stable random per-install id, minted on first use (spec Phase 5)."""
     profile = secrets.get(TELEMETRY_PROFILE) or {}
     if not profile.get("install_id"):
         profile["install_id"] = "ins_" + _secrets.token_hex(12)
@@ -283,11 +331,15 @@ def install_id(secrets: SecretStore) -> str:
     return profile["install_id"]
 
 
+# [中文] 检查是否开启了遥测功能（默认开启，仅对已登录用户生效）
+# [English] Check if telemetry is enabled (default on, only active when signed in)
 def telemetry_enabled(secrets: SecretStore) -> bool:
     profile = secrets.get(TELEMETRY_PROFILE) or {}
     return bool(profile.get("enabled", True))  # default-on (only matters signed in)
 
 
+# [中文] 设置遥测功能的启用状态
+# [English] Set telemetry enabled flag
 def set_telemetry_enabled(secrets: SecretStore, enabled: bool) -> dict[str, Any]:
     profile = secrets.get(TELEMETRY_PROFILE) or {}
     profile["enabled"] = bool(enabled)
@@ -304,7 +356,10 @@ def emit_session_created(
     persona_family: str,
     workspace_kind: str,
 ) -> bool:
-    """Best-effort, content-free session event. Hard no-op unless signed in AND
+    """[中文] 尽力而为、不含任何实质内容的会话创建事件上报。除非用户已登录且遥测开关处于开启状态，否则直接无操作返回；所有异常均被吞掉（遥测绝不能破坏会话运行）。
+
+    [English]
+    Best-effort, content-free session event. Hard no-op unless signed in AND
     the toggle is on; failures are swallowed (telemetry must never break a session)."""
     import platform as _platform
     import sys
@@ -354,7 +409,13 @@ def begin_managed_connect(
     machine_id: str = "",
     machine_name: str = "",
 ) -> dict[str, Any]:
-    """Authenticated start: returns the provider consent URL for the browser.
+    """[中文] 经过认证的连接流程发起：返回供浏览器打开的提供商授权 URL。
+    需要登录 —— 无论如何手动粘贴 Token 途径依然可用。
+    `access` 指定 Broker 定义的授权许可级别（例如 hubspot 的 read | write）；桌面客户端从不发送具体的 scopes。
+    `flow` 仅供 GitHub 使用："" 表示 GitHub App 安装页面；"authorize" 用于将协作者关联到现有的安装上。
+
+    [English]
+    Authenticated start: returns the provider consent URL for the browser.
     Requires sign-in — the manual token path stays available regardless.
     `access` names a broker-defined consent tier (hubspot read | write); the
     desktop never sends scopes. `flow` is GitHub-only: "" = the App install
@@ -403,7 +464,12 @@ def begin_managed_connect(
 
 
 def consume_managed_state(state: str) -> Optional[dict[str, Any]]:
-    """Consume one recent managed-OAuth callback state exactly once.
+    """[中文] 严格一次性消费最近的托管 OAuth 回调状态。
+
+    返回待处理记录（{"machine_id": …, "machine_name": …}），以便回调能正确路由针对特定机器的授权；若状态未知或已过期则返回 None。
+
+    [English]
+    Consume one recent managed-OAuth callback state exactly once.
 
     Returns the pending record ({"machine_id": …, "machine_name": …}) so the
     callback can route a machine-targeted grant, or None for an unknown or
@@ -417,7 +483,12 @@ def consume_managed_state(state: str) -> Optional[dict[str, Any]]:
 
 
 def managed_profile_from_callback(form: dict[str, str]) -> dict[str, Any]:
-    """Local connector profile from the broker's form-POST payload.
+    """[中文] 从 Broker 的 form-POST 负载构建本地连接器配置。
+
+    字段与手动粘贴格式兼容（包含 `access_token` 等），因此工具与权限关卡能以完全相同的方式处理两条路径；托管特有字段（refresh_token、connection_id）用于支持 Broker 自动续期与云端解绑。
+
+    [English]
+    Local connector profile from the broker's form-POST payload.
 
     Field-compatible with a manual paste (`access_token` etc.) so tools and
     gating treat both paths identically; the managed extras (refresh_token,
@@ -451,7 +522,12 @@ def delegate_connection(
     seal_pubkey: str = "",
     machine_id: str = "",
 ) -> Optional[dict[str, str]]:
-    """Handoff step (machines spec §Remote OAuth): mark a managed connection
+    """[中文] 移交步骤（machines 规范 §Remote OAuth）：在 Broker 端将托管连接标记为由特定机器持有，使机器可以通过持有凭据进行自主续期。
+
+    返回 {"user_id": …, "machine_credential": …} —— 两者均随授权传递。仅当提供了 `seal_pubkey`（机器的固定封印公钥）时才会下发凭据：Broker 随后会生成连接作用域的机密，用于验证机器的事件轮询（规范 §Managed events），并将该连接的中继事件切换到该机器的加密队列。`machine_id`（规范 §Fly sandboxes）指定托管控制平面所认知的持有机器，以便 Broker 在队列中放入事件后唤醒休眠的沙箱；仅托管环境记录（`cloud:`）具有此 ID。返回 None 表示未成功委派。
+
+    [English]
+    Handoff step (machines spec §Remote OAuth): mark a managed connection
     machine-held at the broker, so the machine can renew it by possession.
 
     Returns {"user_id": …, "machine_credential": …} — both travel with the
@@ -500,7 +576,10 @@ def refresh_managed_token(
     *,
     profile_key: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
-    """Renew a managed connector token through the broker. Returns the updated
+    """[中文] 通过 Broker 续期托管连接器的 Token。返回更新后的配置，如果无法通过该方式续期（或无需续期）则返回 None。手动配置绝不触动。`profile_key` 针对按账户索引的配置（例如 `gmail:account:<email>`）；默认值为 `<name>:default`。
+
+    [English]
+    Renew a managed connector token through the broker. Returns the updated
     profile, or None if this profile can't be (or doesn't need to be) renewed
     that way. Manual profiles are never touched. `profile_key` targets an
     account-keyed profile (`gmail:account:<email>`); default = `<name>:default`."""
@@ -563,7 +642,10 @@ def ensure_fresh_connector_token(
     profile_key: Optional[str] = None,
     leeway: int = 120,
 ) -> None:
-    """Refresh-on-expiry hook for connector tools: if this is a managed profile
+    """[中文] 连接器工具的“过期自动刷新”钩子：如果这是即将过期的托管配置，则在就地续期。对手动配置无操作。
+
+    [English]
+    Refresh-on-expiry hook for connector tools: if this is a managed profile
     about to expire, renew it in place. No-op for manual profiles."""
     key = profile_key or f"{connector}:default"
     profile = secrets.get(key) or {}
@@ -578,7 +660,12 @@ def ensure_fresh_connector_token(
 def revoke_connector_connections(
     secrets: SecretStore, config: Config, connector: str
 ) -> int:
-    """Revoke every live broker connection for a connector, by NAME.
+    """[中文] 按名称撤销指定连接器的所有活动 Broker 连接。
+
+    机器持有场景（machines 规范 §Managed events）：节点机器自身断开时只删除本地副本，无法触达 Broker（因设计上无 Cloud 会话），这会导致委派残留且事件丢失。桌面端持有会话，因此由桌面端执行撤销 —— 无需本地存在该配置（桌面端在移交时已遗忘授权）。返回被撤销的连接数。
+
+    [English]
+    Revoke every live broker connection for a connector, by NAME.
 
     The machine-held case (machines spec §Managed events, drill finding): a
     box's own disconnect deletes its copy but cannot reach the broker (no
@@ -624,7 +711,10 @@ def cloud_disconnect(
     *,
     profile_key: Optional[str] = None,
 ) -> None:
-    """Best-effort: tell the cloud a managed connection is gone so its metadata
+    """[中文] 尽力而为：通知云端托管连接已移除，以便将其元数据状态置为已断开。无论云端通知成功与否，本地删除始终执行。
+
+    [English]
+    Best-effort: tell the cloud a managed connection is gone so its metadata
     flips to disconnected. Local deletion always proceeds regardless."""
     profile = secrets.get(profile_key or f"{connector}:default") or {}
     connection_id = profile.get("connection_id")
@@ -644,6 +734,8 @@ def cloud_disconnect(
         pass
 
 
+# [中文] installation_id -> (token, expires_epoch)。设计上仅保存在内存中：GitHub 安装 Token 有效期约 1 小时且可随时向 Broker 重新签发；按 github-relay-spec §4 规范，绝不可写入 SecretStore。
+# [English]
 # installation_id -> (token, expires_epoch). MEMORY ONLY by design: GitHub
 # installation tokens live ~1 h and are re-minted from the broker; they must
 # never touch the secret store (github-relay-spec §4).
@@ -654,7 +746,10 @@ _GITHUB_TOKEN_LEEWAY = 600  # re-mint when < 10 min of life remains
 def github_installation_token(
     secrets: SecretStore, config: Config, installation_id: str, *, force: bool = False
 ) -> str:
-    """A live installation access token for GitHub API calls, minted via the
+    """[中文] 获取用于 GitHub API 调用的实时安装访问 Token，通过经过认证的 Broker 路由签发并在内存中缓存（约 50 分钟）。`force` 跳过缓存 —— 用于 401 重试路径。不可用时返回空字符串（未登录 / 已撤销安装 / 无法连接云端）。
+
+    [English]
+    A live installation access token for GitHub API calls, minted via the
     authenticated broker route and cached in memory (~50 min). `force` skips
     the cache — the 401 retry path. Empty string when unavailable (signed
     out / revoked installation / cloud unreachable)."""
@@ -713,14 +808,20 @@ def github_installation_token(
 
 
 def clear_github_token(installation_id: str) -> None:
-    """Drop a cached installation token (disconnect / revocation)."""
+    """[中文] 从内存缓存中丢弃某个 GitHub 安装 Token（用于断开连接或撤销时）。
+
+    [English]
+    Drop a cached installation token (disconnect / revocation)."""
     _GITHUB_TOKEN_CACHE.pop(str(installation_id or "").strip(), None)
 
 
 def github_disconnect_installation(
     secrets: SecretStore, config: Config, installation_id: str
 ) -> None:
-    """Best-effort: delete this user's relay routing rows for one installation
+    """[中文] 尽力而为：删除当前用户关于该 GitHub 安装的中继路由记录，使云端停止向其推送事件。无论如何本地配置删除始终执行（云端记录仅负责路由）。
+
+    [English]
+    Best-effort: delete this user's relay routing rows for one installation
     so the cloud stops pushing its events. Local profile deletion always
     proceeds regardless (the row only routes)."""
     clear_github_token(installation_id)
@@ -741,7 +842,10 @@ def github_disconnect_installation(
 def slack_disconnect_workspace(
     secrets: SecretStore, config: Config, team_id: str
 ) -> None:
-    """Best-effort: delete this user's relay routing row for one workspace so the
+    """[中文] 尽力而为：删除当前用户关于该 Slack 工作区的中继路由记录，使云端停止向其推送事件。无论如何本地 Token 删除始终执行（云端记录仅负责路由；没有桌面端 Token 本来也无法发送消息）。
+
+    [English]
+    Best-effort: delete this user's relay routing row for one workspace so the
     cloud stops pushing its events. Local token deletion always proceeds regardless
     (the row only routes; without the desktop token nothing can be sent anyway)."""
     token = fresh_access_token(secrets, config)
@@ -761,6 +865,8 @@ def slack_disconnect_workspace(
 # --- persona gallery -----------------------------------------------------------
 
 
+# [中文] 向云端 Persona 画廊 API 发送带认证的 GET 请求
+# [English] Send authenticated GET request to cloud Persona gallery API
 def _gallery_get(secrets: SecretStore, config: Config, path: str) -> Optional[dict]:
     token = fresh_access_token(secrets, config)
     if not token:
@@ -777,17 +883,25 @@ def _gallery_get(secrets: SecretStore, config: Config, path: str) -> Optional[di
 
 
 def gallery_list(secrets: SecretStore, config: Config) -> Optional[dict]:
-    """Curated persona cards visible to this user's tenant; None when signed
+    """[中文] 获取对当前用户租户可见的精选 Persona 卡片列表；未登录或无法连接云端时返回 None（按设计画廊需要登录）。
+
+    [English]
+    Curated persona cards visible to this user's tenant; None when signed
     out or the cloud is unreachable (gallery requires sign-in by design)."""
     return _gallery_get(secrets, config, "/v1/personas/gallery")
 
 
+# [中文] 获取指定 Persona 的清单（manifest）详情
+# [English] Fetch manifest details for a persona slug
 def gallery_manifest(secrets: SecretStore, config: Config, slug: str) -> Optional[dict]:
     return _gallery_get(secrets, config, f"/v1/personas/gallery/{slug}/manifest")
 
 
 def gallery_install_event(secrets: SecretStore, config: Config, slug: str) -> None:
-    """Best-effort product telemetry (slug/version only, no content)."""
+    """[中文] 尽力而为的产品遥测（仅上报 slug 与版本，绝不含实质内容）。
+
+    [English]
+    Best-effort product telemetry (slug/version only, no content)."""
     token = fresh_access_token(secrets, config)
     if not token:
         return
@@ -804,7 +918,10 @@ def gallery_install_event(secrets: SecretStore, config: Config, slug: str) -> No
 
 
 def gallery_detail(secrets: SecretStore, config: Config, slug: str) -> Optional[dict]:
-    """Solo-page payload: the cloud card + publisher pitch, with capability
+    """[中文] 独立详情页数据载荷：云端卡片 + 发布者宣传介绍，其中能力事实通过桌面端自身的严格解析器在本地从清单中推导得出 —— 宣传介绍绝不可能夸大安装时许可审查所不显示的内容，因为两个视图源自同一个解析后的清单。
+
+    [English]
+    Solo-page payload: the cloud card + publisher pitch, with capability
     facts derived LOCALLY from the manifest via the desktop's own strict
     parser — the pitch can never advertise what install-time consent wouldn't
     show, because both views come from the same parsed manifest."""
@@ -839,7 +956,10 @@ def broker_request(
     path: str,
     body: Optional[dict[str, Any]] = None,
 ) -> tuple[int, Any]:
-    """One user-authed call to the broker for the desktop GUI's cloud views
+    """[中文] 为桌面 GUI 的云端视图向 Broker 发起带用户认证的单一调用（UX-049 4c）。返回 (status, json)；未登录时返回 (401, …)；无法连接时返回 (0, …)。Token 绝不离开本进程。
+
+    [English]
+    One user-authed call to the broker for the desktop GUI's cloud views
     (UX-049 4c). Returns (status, json); (401, …) when signed out; (0, …)
     when unreachable. The token stays in this process."""
     token = fresh_access_token(secrets, config)

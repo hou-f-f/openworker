@@ -1,4 +1,12 @@
-"""The `web_search` tool + provider resolution.
+"""[中文] `web_search` 工具 + 提供方解析逻辑。
+
+提供方选取顺序（按优先级）：SecretStore 配置档 `web_search:default` (`{provider, api_key}`)
+→ 配置项 `web_search_provider` 的值 → 无需 key 的 `duckduckgo` 默认提供方。
+API Key 通过 SecretStore 解析 `${VAR}` 环境变量。
+该工具为只读；搜索结果为外部内容，必须视为不可信数据，而非执行指令。
+
+[English]
+The `web_search` tool + provider resolution.
 
 Provider selection (in order): the SecretStore profile `web_search:default` (`{provider,
 api_key}`) → the `web_search_provider` config value → the keyless `duckduckgo` default. Keys
@@ -43,9 +51,15 @@ _SCHEMA = {
 def provider_name(
     secrets: Optional[SecretStore] = None, *, default: str = "duckduckgo"
 ) -> str:
-    """The configured provider's NAME, without building (or validating) the provider.
+    """[中文] 已配置提供方的名称（NAME），不构建（也不验证）提供方实例。
+    与 `resolve_provider` 具有相同的解析顺序。由 web_search 审批卡片使用，
+    该卡片需要指明实时的搜索目的地（§1.9："currently: ‹name›"，绝不是 "default:"）。
+
+    [English]
+    The configured provider's NAME, without building (or validating) the provider.
     Same resolution order as `resolve_provider`. Used by the web_search approval card,
-    which names the live destination (§1.9: "currently: ‹name›", never "default:")."""
+    which names the live destination (§1.9: "currently: ‹name›", never "default:").
+    """
     secrets = secrets or SecretStore()
     profile = secrets.get("web_search:default") or {}
     return profile.get("provider") or _config_provider() or default
@@ -75,7 +89,11 @@ def make_web_search_tool(
     *,
     provider: Optional[WebSearchProvider] = None,
 ) -> Callable[..., Any]:
-    """Build the `web_search` tool. `provider` overrides resolution (used by tests)."""
+    """[中文] 构建 `web_search` 工具。`provider` 参数可覆盖解析逻辑（供测试使用）。
+
+    [English]
+    Build the `web_search` tool. `provider` overrides resolution (used by tests).
+    """
 
     def web_search(query: str, max_results: int = 5) -> dict[str, Any]:
         try:
@@ -85,7 +103,7 @@ def make_web_search_tool(
         n = max_results if isinstance(max_results, int) else 5
         try:
             results = p.search(query, max_results=max(1, min(n, 10)))
-        except Exception as exc:  # network / library / quota
+        except Exception as exc:  # [中文] 网络 / 客户端库 / 配额限制 / [English] network / library / quota
             return {
                 "error": f"web search failed: {exc}",
                 "provider": getattr(p, "name", "?"),

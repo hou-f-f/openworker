@@ -1,4 +1,8 @@
-"""Web search — a keyless DuckDuckGo default + configurable third-party providers."""
+"""[中文] Web 搜索 —— 无需 API Key 的 DuckDuckGo 默认提供方 + 可配置的第三方提供方。
+
+[English]
+Web search — a keyless DuckDuckGo default + configurable third-party providers.
+"""
 
 from __future__ import annotations
 

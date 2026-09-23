@@ -1,4 +1,15 @@
-"""The chat store — group chat as its own abstraction (eighth pass, 2026-08-16).
+"""[中文] 群聊存储 —— 作为独立抽象的群组聊天（第八版迭代，2026-08-16）。
+
+一个 GROUP 群组由 `{group_id, name, members[]}` 加上仅追加消息日志以及各成员未读游标组成。
+在 v1 版本中每个团队对应一个群组（在启用聊天的团队成员配置门控处创建），但此处底层并不依赖看板或团队概念
+—— 群组后续可支持非团队聊天以及外部聊天方言。
+
+唤醒语义位于读取端：智能体发送的消息仅“针对”被 @提及 的成员；
+而 USER 用户的消息针对所有成员（[User] 具有最高优先级 —— 用户在频道中发言是罕见且深思熟虑的）。
+未提及的智能体闲聊不会唤醒任何人，这在结构上保证了聊天通道作为“异常处理通道”的定位。
+
+[English]
+The chat store — group chat as its own abstraction (eighth pass, 2026-08-16).
 
 A GROUP is `{group_id, name, members[]}` plus an append-only message log and
 per-member unread cursors. One group per team in v1 (created at the staffing gate
@@ -57,10 +68,14 @@ class ChatStore:
             """)
         self._conn.commit()
 
-    # ---------------------------------------------------------------------- groups
+    # ---------------------------------------------------------------------- [中文] 群组管理 / [English] groups
 
     def create_group(self, name: str, members: list[dict[str, Any]]) -> dict[str, Any]:
-        """`members`: [{name, persona, role}] — `name` is the member's handle
+        """[中文] `members`: [{name, persona, role}] —— `name` 为成员 handle（即 @mention 目标）。
+        用户隐式参与，不作为成员数据行存在。
+
+        [English]
+        `members`: [{name, persona, role}] — `name` is the member's handle
         (@mention target). The user participates implicitly and is not a member row."""
         handles = [str(m.get("name", "")).strip() for m in members]
         if not name.strip():
@@ -105,12 +120,16 @@ class ChatStore:
         group["members"] = json.loads(group.pop("members") or "[]")
         return group
 
-    # -------------------------------------------------------------------- messages
+    # -------------------------------------------------------------------- [中文] 消息管理 / [English] messages
 
     def post(
         self, group_id: str, author: str, text: str, *, author_role: str = "worker"
     ) -> dict[str, Any]:
-        """Append one message. Mentions are parsed against member handles —
+        """[中文] 追加一条消息。针对成员 handle 解析 @mention —— 文本中任意位置的 `@name` ——
+        因此标记无需单独的参数。
+
+        [English]
+        Append one message. Mentions are parsed against member handles —
         `@name` anywhere in the text — so tagging needs no separate parameter."""
         group = self.get_group(group_id)
         if group is None:
@@ -161,10 +180,14 @@ class ChatStore:
             ).fetchall()
         return [_row_to_message(row) for row in rows]
 
-    # ------------------------------------------------------- unread / wake reads
+    # ------------------------------------------------------- [中文] 未读 / 唤醒读取 / [English] unread / wake reads
 
     def unread_for(self, group_id: str, member: str) -> list[dict[str, Any]]:
-        """Messages this member should be WOKEN for: posts that @mention it, plus
+        """[中文] 该成员应当被唤醒（WOKEN）的消息列表：@提及 该成员的消息，加上所有用户消息。
+        该成员自身发送的消息绝不算入。
+
+        [English]
+        Messages this member should be WOKEN for: posts that @mention it, plus
         every user post. Its own posts never count."""
         out = []
         for message in self.messages(group_id, since_seq=self._cursor(group_id, member)):
@@ -175,7 +198,10 @@ class ChatStore:
         return out
 
     def unread_count(self, group_id: str, member: str) -> int:
-        """Plain unread count (all messages since the member's cursor) — drives the
+        """[中文] 纯未读计数（自该成员游标之后的所有消息）—— 用于驱动用户的侧边栏徽章，用户的 'member' 标识键为 "user"。
+
+        [English]
+        Plain unread count (all messages since the member's cursor) — drives the
         sidebar badge for the USER, whose 'member' key is "user"."""
         with self._lock:
             row = self._conn.execute(

@@ -1,4 +1,7 @@
-"""Automation — scheduled tasks that run in the always-on server."""
+"""[中文] 自动化（Automation）—— 在常驻服务中定时运行的调度任务。
+
+[English]
+Automation — scheduled tasks that run in the always-on server."""
 
 from __future__ import annotations
 

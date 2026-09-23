@@ -1,4 +1,17 @@
-"""One engine per state directory.
+"""[中文] 每个状态目录仅限一个引擎。
+
+两个引擎同时写入同一个状态目录会静默地相互损坏：SQLite 行在缓存句柄后消失、
+看板出现两个写入者、会话双重唤醒。我们在实际发布中遇到的真实故障是一台虚拟机上有两个 systemd 用户单元，
+两者都在运行 `openworker up`（第一次机器测试遗留的陈旧 `openworker.service` 与手动编写的单元并存）—
+每一次 "kill the stray" 都在 5 秒后被 `Restart=always` 还原。
+该锁让第二个引擎识别此情况并主动退出，而不是直接运行。
+
+`acquire()` 在返回的句柄（实际中即进程生命周期）的存续期间持有对 `<state>/engine.lock` 的建议锁（advisory lock），
+并在文件中记录持有者的 pid 以便在拒绝消息中显示。POSIX 使用 flock；Windows 在第一个字节上使用 msvcrt.locking。
+在两者均不存在的环境下尽力而为：锁降级为“总是获取成功”，而不是阻断启动。
+
+[English]
+One engine per state directory.
 
 Two engines writing one state dir corrupt each other quietly: SQLite rows
 vanish behind a cached handle, boards get two writers, sessions double-wake.
@@ -39,7 +52,8 @@ class EngineBusy(RuntimeError):
 
 
 class EngineLock:
-    """Handle returned by `acquire()`; keep it referenced. `release()` is for tests."""
+    """[中文] 由 `acquire()` 返回的句柄；请保持对它的引用。`release()` 仅供测试使用。
+    [English] Handle returned by `acquire()`; keep it referenced. `release()` is for tests."""
 
     def __init__(self, path: Path, fh) -> None:
         self.path = path
@@ -81,7 +95,8 @@ def _try_lock(fh) -> bool:
 
 
 def holder_pid(state: Path) -> Optional[int]:
-    """Pid recorded by the current holder, if any (informational only)."""
+    """[中文] 当前持有者记录的 pid（如果有，仅供展示参考）。
+    [English] Pid recorded by the current holder, if any (informational only)."""
     try:
         text = (Path(state) / LOCK_NAME).read_text().strip()
         return int(text) if text else None
@@ -90,13 +105,17 @@ def holder_pid(state: Path) -> Optional[int]:
 
 
 def acquire(state: Path, *, timeout: float = 0.0) -> EngineLock:
-    """Take the engine lock for `state`, waiting up to `timeout` seconds for a
+    """[中文] 获取 `state` 目录的引擎锁，最多等待 `timeout` 秒以等待即将退出的前驱进程
+    （例如 supervisor 在旧进程仍在销毁退出时重启了我们）。如果锁持续被占用，则抛出 `EngineBusy`。
+
+    [English] Take the engine lock for `state`, waiting up to `timeout` seconds for a
     dying predecessor (a supervisor restarting us while the old process is
     still tearing down). Raises `EngineBusy` when it stays held."""
     state = Path(state)
     state.mkdir(parents=True, exist_ok=True)
     path = state / LOCK_NAME
-    # "a+" never truncates: the holder's pid stays readable for the message.
+    # [中文] "a+" 模式绝不会截断：持有者的 pid 保持可读以便输出消息。
+    # [English] "a+" never truncates: the holder's pid stays readable for the message.
     fh = open(path, "a+")
     deadline = time.monotonic() + max(0.0, timeout)
     while True:

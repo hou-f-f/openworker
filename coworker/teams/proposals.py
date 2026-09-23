@@ -1,10 +1,15 @@
-"""Structured proposal intent. Declarations never grant execution authority."""
+"""[中文] 结构化提案意向（Proposal intent）。声明本身绝不授予执行权限。
+
+[English]
+Structured proposal intent. Declarations never grant execution authority."""
 from __future__ import annotations
 
 import re
 from copy import deepcopy
 
 
+# [中文] 构造不允许额外属性的 JSON Schema 对象定义
+# [English] Construct a JSON Schema object definition with additionalProperties disallowed
 def obj(properties, required=None):
     return {"type": "object", "properties": properties, "required": required or list(properties), "additionalProperties": False}
 
@@ -13,10 +18,14 @@ TEXT = {"type": "string", "minLength": 1, "maxLength": 600}
 KEY = {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,47}$"}
 
 
+# [中文] 构造指定元素类型与长度范围的 JSON Schema 数组定义
+# [English] Construct a JSON Schema array definition with bounds
 def array(item, minimum=0, maximum=100):
     return {"type": "array", "items": item, "minItems": minimum, "maxItems": maximum}
 
 
+# [中文] 团队提案与工作提案各部分的基础 Schema 定义
+# [English] Base schema definitions for proposal components
 GROUP = obj({"id": KEY, "title": TEXT, "summary": TEXT})
 EXTERNAL_ACTIONS = obj({
     "status": {"type": "string", "enum": ["none", "planned", "undetermined"]},
@@ -52,6 +61,8 @@ TEAM_PROPOSAL_SCHEMA = obj({
 })
 
 
+# [中文] 根据 JSON Schema 规则递归校验数据值的类型与约束
+# [English] Recursively validate data value against JSON Schema rules and constraints
 def _check(value, schema, path):
     kind = schema["type"]
     types = {"object": dict, "array": list, "string": str, "integer": int, "boolean": bool}
@@ -83,6 +94,8 @@ def _check(value, schema, path):
         raise ValueError(f"{path} must be positive")
 
 
+# [中文] 确保列表中某一字段的值均唯一，并返回其唯一集合
+# [English] Ensure unique values for a key in rows, returning the unique set
 def _unique(rows, key, label):
     ids = [r[key] for r in rows]
     if len(set(ids)) != len(ids):
@@ -90,6 +103,8 @@ def _unique(rows, key, label):
     return set(ids)
 
 
+# [中文] 校验工作提案（Work Proposal）：确保满足 Schema 规范、活动/工作流存在且非空、依赖关系成无环图（DAG）
+# [English] Validate work proposal: ensure Schema compliance, activities/workstreams exist and nonempty, dependencies form a DAG
 def validate_work_proposal(args):
     _check(args, WORK_PROPOSAL_SCHEMA, "proposal")
     acts = _unique(args["activities"], "id", "activities")
@@ -125,6 +140,8 @@ def validate_work_proposal(args):
     return deepcopy(args)
 
 
+# [中文] 校验团队配置提案（Team Proposal）：确保满足 Schema、成员名称合法唯一且不与保留名称冲突、分组有效且非空
+# [English] Validate team proposal: ensure Schema compliance, valid/unique worker names not colliding with reserved names, valid/nonempty groups
 def validate_team_proposal(args):
     _check(args, TEAM_PROPOSAL_SCHEMA, "proposal")
     groups = _unique(args["groups"], "id", "groups")
@@ -143,6 +160,8 @@ def validate_team_proposal(args):
     return deepcopy(args)
 
 
+# [中文] 提案指引常量：注入到 Lead/Worker 的 Prompt 中，指导模型如何构造结构化决策提案卡片（包含客户产出、活动、工作流、依赖关系与准则，而非大段长篇大论）。
+# [English] Proposal guidance constant: injected into Lead/Worker prompts, directing the model on constructing structured decision cards.
 PROPOSAL_GUIDANCE = """Proposal cards are structured decisions, not essays. Use propose_work_items with a short
 customer outcome (title, summary), explicit targets, domain-appropriate activities and
 workstreams (id/title/summary), and tasks keyed within this proposal. Categories do not

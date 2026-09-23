@@ -1,4 +1,9 @@
-"""CLI entry point.
+"""[中文] CLI 命令行入口点。
+
+公开命令行接口：`openworker join <link>` 与 `openworker up`（两个日常核心命令），`openworker machine <command>`（状态、密钥、日志、系统服务、离开退出），`openworker version` 与帮助信息。终端 UI（`openworker tui` 或指定技能名称）在正式作为独立产品交互面成熟之前暂不列出。
+
+[English]
+CLI entry point.
 
 Public surface: `openworker join <link>` and `openworker up` (the two everyday commands),
 `openworker machine <command>` (status, keys, logs, service, leave), `openworker version`,
@@ -43,7 +48,8 @@ Run `openworker <command> --help` for details.
 Desktop app and docs: https://openworker.com
 """
 
-# Typed at the wrong level: say where the command lives, rather than letting it fall
+# [中文] 当在错误的层级输入命令时的映射字典：提示命令的实际位置，而不是直接穿透到终端 UI 当作未知技能报错。
+# [English] Typed at the wrong level: say where the command lives, rather than letting it fall
 # through to the terminal UI as an unknown skill.
 _AT_TOP = {"join": "join", "up": "up"}
 _UNDER_MACHINE = {
@@ -52,6 +58,8 @@ _UNDER_MACHINE = {
 }
 
 
+# [中文] 当用户输入了旧版或层级错误的命令时，提示正确的命令层级并退出
+# [English] Notify user of the correct command location when typed at the wrong level and exit
 def _moved(typed: str, now: str) -> None:
     import sys
 
@@ -59,6 +67,8 @@ def _moved(typed: str, now: str) -> None:
     raise SystemExit(2)
 
 
+# [中文] CLI 主入口函数：解析顶层子命令（join, up, machine, version, tui 等）并分发执行
+# [English] Main CLI entrypoint: parse top-level subcommands and dispatch execution
 def main(argv: Optional[list[str]] = None) -> None:
     import sys
 
@@ -112,8 +122,12 @@ def main(argv: Optional[list[str]] = None) -> None:
     args = parser.parse_args(args)
 
     workspace = Path(args.cwd).expanduser().resolve()
-    # Unified global store shared with the GUI/server (one place for all conversations).
+    # [中文] 与 GUI/服务端共享的统一全局状态目录（所有会话统一归整处）
+    # [English] Unified global store shared with the GUI/server (one place for all conversations).
     data_dir = state_dir()
+    # [中文] 与 GUI 管理的开关和用户规则保持一致（MEMORY-SPEC §4.3/§6）。
+    # 存储始终接入：关闭意味着“停止学习新事实”，但已保存的事实依然可用。
+    # [English]
     # Same on/off switch and user rules the GUI manages (MEMORY-SPEC §4.3/§6). The
     # store is always wired: off means "stop learning", so saved facts stay usable.
     memory_settings = MemorySettingsStore(data_dir / "memory-settings.json")
