@@ -329,7 +329,16 @@ def build_messages(
     provenance: str = "",
     action_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """[中文] 构建单次审查器请求的消息体。专为缓存设计 (§8.2)：所有稳定或仅追加的内容置于最前（指令 · 已知世界 · 历史记录），变化部分（本轮请求 + 单个拟议操作）置于最后。绝不将操作放在最前。
+    """[中文] 组装一次“自动审批审查”的模型输入。
+
+    审查器每次只判断一个拟执行动作，例如“这次 run_shell 参数能不能自动放行”。
+    这里把输入拆成两部分：前半段放稳定内容（审查规则、会话已知环境、较早的用户原话），
+    后半段放每次都会变化的内容（当前用户请求 + 当前这个工具调用）。
+
+    这样做有两个目的：
+    1. 让模型只围绕“当前动作是否符合用户请求”做判断，不把工具参数当成新的用户指令。
+    2. 让稳定前缀更容易被 Provider 缓存；每次变化的只有最后一小段。
+
     [English] One reviewer request. Cache-shaped (§8.2): everything stable or append-only first
     (instructions · known world · history), the varying part (this turn's request + the one
     action) last. Never put the action first."""
@@ -365,9 +374,22 @@ def build_messages(
 
 
 class Reviewer:
-    """[中文] 使用会话自身的模型逐一评判每个拟议操作 (§1.5 —— 无需第二份密钥；如果信任该模型来驱动智能体，它就足够强来审查智能体)。
+    """[中文] Auto-Approve 模式里的“模型审查员”。
 
-    故意不保留对完整对话对象的引用：引擎每次调用时传入当前请求和机械提取的用户历史，因此审查器能看到的内容完全在调用点单一位置确定。
+    当主模型想执行一个需要确认的工具调用时，普通模式会弹审批卡片让人决定。
+    Auto-Approve 模式会先调用 Reviewer，让同一个会话模型判断这个动作是否可以自动处理：
+
+    - `allow`：可以自动放行。
+    - `deny`：拒绝执行，并把简短拒绝结果写回给智能体。
+    - `unsure`：不确定，继续交给人类审批。
+
+    Reviewer 使用当前会话自己的模型和账号，不要求第二套模型密钥。设计假设是：
+    如果用户已经信任这个模型驱动智能体工作，那么它也可以先做一层动作审查。
+
+    它故意不保存完整 conversation，也不自己翻聊天记录。每次审查时，engine 只传入一小包
+    明确数据：当前用户请求、机械提取的用户历史、拟执行的工具名和参数、以及少量来源/上下文。
+    这样 Reviewer 能看到什么，全部由调用点统一决定，避免它意外读到工具结果、文件内容或其它
+    不该参与审批判断的上下文。
 
     [English] Judges one action at a time with the session's own model (§1.5 — no second key; if
     it's trusted to drive the agent, it's strong enough to review it).
@@ -389,7 +411,8 @@ class Reviewer:
         self.model = model
         self.known_world = known_world
         self.timeout = timeout
-        # [中文] 计量统计 (§1.7)：计数和 Token 总量，通过审计行和会话摘要展示。绝不用于决策判定。
+        # [中文] 审查计数器：记录审了几次、允许/拒绝/不确定各几次，以及花了多少 token。
+        # 这些数字只用于审计日志和会话摘要展示，绝不反过来影响审批决定。
         # [English] Metering (§1.7): counts and token totals, surfaced via audit rows and the
         # session summary. Never consulted for decisions.
         self.stats: dict[str, int] = {
@@ -413,9 +436,14 @@ class Reviewer:
         provenance: str = "",
         action_context: dict[str, Any] | None = None,
     ) -> Verdict:
-        """[中文] 执行审查。绝不抛出异常。每种失败模式都会退化为 `unsure` 并交由人类决策 (§8.5)。
+        """[中文] 执行一次动作审查，返回 `allow` / `deny` / `unsure`。
+
+        这个方法对调用方“失败关闭”：Provider 报错、超时、回复格式不对、上下文太大等情况，
+        都不会抛异常让主流程崩掉，而是返回 `unsure`，让人类继续决定。
+
         [English] Never raises. Every failure mode is an `unsure` (§8.5)."""
-        # [中文] 绝不静默地削减用户词句中的限制。这是确定性的大小限制，而非范围分类器；超大输入直接询问人类。
+        # [中文] 不悄悄裁掉用户说过的限制条件。若当前请求、历史和上下文合起来太大，
+        # 这里不尝试“聪明地摘要”或猜哪些限制不重要，而是直接返回 unsure，让人类审批。
         # [English] Never quietly truncate restrictions out of the owner's words. This is a
         # deterministic size limit, not a scope classifier; oversized input asks a human.
         if action_context and action_context.get("context_unavailable"):
@@ -437,7 +465,10 @@ class Reviewer:
                     self.provider.complete,
                     model=self.model,
                     messages=messages,
-                    # One JSON line comes back. Without an explicit cap the provider's
+                    # [中文] 审查器只需要模型返回一行 JSON 裁决。这里显式限制输出长度：
+                    # 如果不设上限，某些 Provider 的默认值很大，会触发 SDK 的长请求保护，
+                    # 导致所有审查都失败并退回 unsure。
+                    # [English] One JSON line comes back. Without an explicit cap the provider's
                     # default (32k on Anthropic) trips the SDK's "streaming required for
                     # long requests" guard, and every verdict fails closed to `unsure`
                     # (found live 2026-09-16: a whole session of cards under Auto-Approve).
