@@ -117,9 +117,9 @@ Tests: `.venv/bin/pytest` (server), `npm test` and `npm run e2e` in `surfaces/gu
 
 ## Repository layout
 
-New to the codebase? See the [中文项目学习手册](docs/project-guide.zh-CN.md) for a directory map, module relationships, execution flows, and a guided reading path.
+New to the codebase? See the [中文项目学习手册](docs/项目学习手册.md) for a directory map, module relationships, execution flows, and a guided reading path.
 
-For a focused first pass and a documentation-led Hermes study path, see [Agent 学习路线：浅读 OpenWorker，主学 Hermes](docs/agent-learning-roadmap.zh-CN.md).
+For a focused first pass and a documentation-led Hermes study path, see [Agent 学习路线：浅读 OpenWorker，主学 Hermes](docs/智能体学习路线.md).
 
 | Directory | What's in it |
 |---|---|
