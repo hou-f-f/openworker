@@ -203,38 +203,61 @@ class TurnEngine:
         self.messages: list[dict[str, Any]] = list(messages or [])
         self._tool_timings: dict[str, dict[str, float]] = {}
         self.audit_sink = audit_sink
+        # 返回一个临时 `<system-context>` 块，仅在发送时追加到最后一条用户消息（绝不持久化）。
+        # 我们无法跨 Provider 可靠地在对话中途注入 system 消息，因此动态的逐轮上下文
+        # （例如实时目录列表）挂载在最新用户轮次上。无内容时返回 ""。
         # Returns an ephemeral `<system-context>` block appended to the LAST user message at
         # send-time only (never persisted). We can't reliably inject system messages mid-thread
         # across providers, so dynamic per-turn context (e.g. the live directory list) rides on
         # the latest user turn. Returns "" when there's nothing to add.
         self.context_provider = context_provider
+        # 处理 `request_directory` 工具：发出 DIRECTORY_REQUESTED 提示，等待用户带外同意/拒绝
+        # 某个文件夹授权，将授权应用到当前实时会话，并返回结果。不能提示的界面传 None
+        # （该工具随后成为 no-op）。
         # Handles the `request_directory` tool: emits a DIRECTORY_REQUESTED prompt, waits for the
         # user to grant/decline a folder out-of-band, applies the grant to this live session, and
         # returns the outcome. None on surfaces that can't prompt (the tool then no-ops).
         self.directory_requester = directory_requester
+        # 处理 `request_tool` 工具：发出 TOOL_REQUESTED，等待用户安装固定版本或拒绝。
+        # 不能提示的界面传 None（该工具随后成为 no-op，并明确告知智能体，以便它公开降级处理，
+        # 而不是悄悄跳过）。
         # Handles the `request_tool` tool: emits TOOL_REQUESTED, waits for the user to install
         # the pinned build or decline. None on surfaces that can't prompt (the tool then
         # no-ops, and the agent is told so it can fall back openly rather than skip silently).
         self.tool_requester = tool_requester
+        # 处理 `propose_plan` 工具：发出 PLAN_PROPOSED，等待用户决定。批准后将实时
+        # PermissionEngine 切出 plan 模式（同一会话继续，保留上下文）。不能提示的界面传 None
+        # （该工具随后成为 no-op）。
         # Handles the `propose_plan` tool: emits PLAN_PROPOSED, waits for the user's decision.
         # An approving result flips the live PermissionEngine out of plan mode (same session,
         # context kept). None on surfaces that can't prompt (the tool then no-ops).
         self.plan_approver = plan_approver
+        # 处理 `propose_team` 工具（人员配备关卡）：发出 TEAM_PROPOSED，等待用户决定；
+        # 批准后预先创建工作节点会话，结果携带花名册（actor id）。不能提示的界面传 None。
         # Handles the `propose_team` tool (the staffing gate): emits TEAM_PROPOSED, waits
         # for the user's decision; approval pre-spawns the worker sessions and the result
         # carries the roster (actor ids). None on surfaces that can't prompt.
         self.team_approver = team_approver
         self.connector_requester = connector_requester
+        # 处理 `propose_work_items`（任务拆解关卡）：发出 ITEMS_PROPOSED 并等待；
+        # 批准后在看板上创建工作项。它按设计与权限模式无关：不同于 propose_plan，
+        # 它不携带权限模式语义。propose_plan 是“实现计划”（步骤/文件、退出 plan 模式），
+        # 这里是把团队工作拆解到看板上。
         # Handles `propose_work_items` (the decomposition gate): emits ITEMS_PROPOSED,
         # waits; approval creates the items on the board. Mode-independent by design —
         # unlike propose_plan it carries no permission-mode semantics: propose_plan is
         # an IMPLEMENTATION plan (steps/files, plan-mode exit); this is a team
         # decomposition onto the board.
         self.items_approver = items_approver
+        # 处理 `ask_user` 工具：把问题转换为 Inbox 项并等待回答（有人值守时可在实时会话内回答，
+        # 无人值守时可从 Inbox 回答）。不能提问的界面传 None（该工具随后成为 no-op）。
         # Handles the `ask_user` tool: turns a question into an Inbox item and waits for the answer
         # (answerable inline in a live session or from the Inbox when unattended). None on surfaces
         # that can't ask (the tool then no-ops).
         self.question_asker = question_asker
+        # 自动压缩 (OPE-27)：由界面/manager 在构造后设置，从而保持构造函数签名稳定。
+        # `compaction_settings` 是实时 getter（设置变更无需重建即可生效）；`is_attended`
+        # 控制失败提示（None → 视为无人值守：后台运行绝不因内部账务停住等待）。
         # Auto-compaction (OPE-27) — set post-construction by the surface/manager so the
         # constructor footprint stays put. `compaction_settings` is a live getter (Settings
         # changes apply without a rebuild); `is_attended` gates the failure prompt (None →
@@ -262,12 +285,20 @@ class TurnEngine:
         self._reviewer_denials = 0
         self._reviewer_verdicts: dict[str, Any] = {}
         self._reviewer_input_snapshots: dict[str, Any] = {}
+        # (c) 每个有后果调用是如何被放行的，按 tool_call id 记录：
+        # {"origin": "reviewer"|"bypass"|"user", "note": <审查器理由>, "grant": <用户结果>}。
+        # _record_result 会把它写入 TOOL_FINISHED 事件，也会写入工具消息的 `_display` 伴生字段，
+        # 因而静默来源标签在重载后仍保留（所有者裁定 2026-08-24）——仅展示用，Provider 永不可见。
         # (c) How each consequential call got cleared, keyed by tool_call id:
         # {"origin": "reviewer"|"bypass"|"user", "note": <reviewer reasoning>, "grant":
         # <user outcome>}. Consumed by _record_result into the TOOL_FINISHED event AND
         # into the tool message's `_display` sidecar, so the quiet provenance chips
         # survive reload (owner ruling 2026-08-24) — display-only, never provider-visible.
         self._approval_origins: dict[str, dict[str, str]] = {}
+        # 影子评估（规范第 6 部分第 3 步）：为 True 且已接入审查器时，审查器记录它
+        # “本来会”对每张审批卡片做出的裁决，但实际仍由人决定。即发即弃：卡片绝不延迟，
+        # 决策绝不被改写，裁决写入审计日志（stage="reviewer_shadow"，通过 call_id 与人的
+        # approval_resolved 行关联）。
         # Shadow evaluation (spec Part 6 step 3): when True and a reviewer is attached, the
         # reviewer records what it WOULD have decided on each approval card while the human
         # still decides. Fire-and-forget — the card is never delayed, no decision is ever
@@ -275,6 +306,9 @@ class TurnEngine:
         # to the human's approval_resolved row by call_id).
         self.reviewer_shadow = False
         self._shadow_tasks: set[asyncio.Task] = set()
+        # 一次性“仍然允许”授权（§8.4）：只能由人点击拒绝卡片生成，键为精确工具名 +
+        # 规范化参数，首次匹配即消耗。稍有不同的再次提议都不会命中，必须回到审查器/卡片流程——
+        # 刻意收窄，刻意不是长期规则。
         # One-shot "Allow anyway" grants (§8.4): minted ONLY by a human clicking the deny
         # card, keyed on the exact tool + canonical arguments, consumed on first match. A
         # re-proposal with even slightly different arguments does not match and goes back
@@ -292,6 +326,10 @@ class TurnEngine:
         # merge in `_user_history` stays chronological. Runtime-only on purpose: a restart
         # costs the reviewer context (more cards), never correctness.
         self._ask_replies: list[tuple[int, str, str]] = []  # (anchor, answer, question)
+        # 工具审批卡片的额外用户可见字段，会合并进 PERMISSION_REQUIRED 载荷。
+        # 例如 web_search 的实时 Provider 名称，让卡片能说明查询实际发往何处（§1.9）。
+        # 由界面在构造后设置（引擎自身不知道 Provider 细节）；None 表示无额外字段。
+        # 在卡片生成时调用，而不是会话开始时调用，因此会话中途的设置变更可反映出来。
         # Extra user-facing fields for a tool's approval card, merged into the
         # PERMISSION_REQUIRED payload — e.g. web_search's live provider name, so the card
         # can say where queries actually go (§1.9). Set post-construction by the surface
@@ -345,7 +383,13 @@ class TurnEngine:
 
     # -- external controls ------------------------------------------------------
     def request_interrupt(self) -> None:
-        """Stop the turn as soon as possible, from ANY state: mid-stream (the producer
+        """尽快从任意状态停止当前轮次：流式输出中（生产线程在 chunk 间丢弃流）、
+        工具执行中（interrupt hooks 终止运行中的命令）、等待审批/问题/计划中
+        （await 以 interrupted 结果返回），或迭代之间（主循环检查点）。
+        每个待处理 tool_call 仍会得到一个工具错误结果，确保历史不留下孤儿调用
+        （托管模板会拒绝孤儿调用，持久化恢复也会重新提示它们）。
+
+        Stop the turn as soon as possible, from ANY state: mid-stream (the producer
         thread drops the stream between chunks), mid-tool (interrupt hooks kill the
         running command), awaiting an approval/question/plan (the await resolves as
         interrupted), or between iterations (the loop checkpoint). Every pending
@@ -359,7 +403,10 @@ class TurnEngine:
                 pass  # best-effort: a dead executor must not block the stop
 
     async def _interruptible(self, coro: Any, interrupted: Any) -> Any:
-        """Await `coro`, but resolve early with `interrupted` if the user stops the
+        """等待 `coro`，但如果用户停止当前轮次，则提前以 `interrupted` 返回。
+        待处理 task 会被取消，因此稍后才回答的 Inbox 卡片会成为 no-op。
+
+        Await `coro`, but resolve early with `interrupted` if the user stops the
         turn. The pending task is cancelled so an answered-later Inbox card no-ops."""
         task = asyncio.ensure_future(coro)
         cancel_wait = asyncio.ensure_future(self._cancel.wait())
@@ -468,7 +515,13 @@ class TurnEngine:
             self.permissions.clear_run_allowances()
 
     def switch_model(self, model: str) -> Optional[str]:
-        """Rebind the session's model mid-conversation (roadmap item 3). History is
+        """在对话中途重新绑定会话模型（roadmap item 3）。
+        历史保持规范 OpenAI 形状，各 Provider 在每次调用时自行转换，因此切换只是写字段；
+        另加一条持久化 notice 标记切换发生的位置。如果历史里有图片而新模型不可见，
+        则给出降级警告（这些图片会以占位符发送，见 `_outbound_messages`）。
+        模型未变化（或新会话首次绑定）时返回 None；否则返回 notice 文本。
+
+        Rebind the session's model mid-conversation (roadmap item 3). History is
         canonical OpenAI shape and every provider converts per call, so the switch is just
         the field write — plus a persisted notice marking WHERE it happened, with a
         degradation warning when history carries images the new model can't see (those are
@@ -511,7 +564,10 @@ class TurnEngine:
         )
 
     def _tail_is_retriable_error(self) -> bool:
-        """True when the history tail is an error notice, looking through any model_switch
+        """当历史尾部是 error notice 时返回 True；会跳过其后的 model_switch notice
+        （模型切换不应消耗 retry 机会）。
+
+        True when the history tail is an error notice, looking through any model_switch
         notices appended after it (a switch must not consume the retry)."""
         for message in reversed(self.messages):
             if message.get("role") != "notice":
@@ -522,7 +578,11 @@ class TurnEngine:
         return False
 
     def _append_notice(self, kind: str, text: Optional[str] = None, **fields: Any) -> None:
-        """Persist a turn-ending marker (error/interrupted) as a display-only `notice`
+        """把轮次结束标记（error/interrupted 等）持久化为仅展示用的 `notice` 消息：
+        它像转录一样能跨重载保留，但 `_outbound_messages` 会丢弃该 role，确保任何 Provider
+        都看不到它。额外 `fields`（例如失败 MCP server 的名称）会作为结构化渲染数据保存在消息上。
+
+        Persist a turn-ending marker (error/interrupted) as a display-only `notice`
         message: it survives reload like the transcript does, but `_outbound_messages`
         drops the role so no provider ever sees it. Extra `fields` (e.g. the failing
         MCP server's name) persist on the message for structured rendering."""
@@ -533,7 +593,11 @@ class TurnEngine:
         self.messages.append(notice)
 
     async def retry(self) -> AsyncIterator[Event]:
-        """Re-run the model loop after a provider error — no new user message; the failed
+        """Provider 错误后重新运行模型循环，不新增用户消息；失败轮次的输入已经在历史尾部。
+        只有尾部是 error notice 时才允许，避免误把已完成轮次重新回答。尾部的 model_switch
+        notice 不会破坏门禁；先切模型再 retry 是预期恢复路径（owner-hit 2026-07-23）。
+
+        Re-run the model loop after a provider error — no new user message; the failed
         turn's input is already the tail of history. Guarded on the tail being an error
         notice so a stray retry frame can't re-answer a completed turn. Trailing
         model_switch notices don't break the guard — switching models and THEN retrying
@@ -546,7 +610,11 @@ class TurnEngine:
             yield event
 
     async def resume(self) -> AsyncIterator[Event]:
-        """Continue a turn that was suspended at a prompt and persisted — durable resume after a
+        """继续一个已持久化、停在提示上的轮次，即重启（或引擎被驱逐）后的持久恢复。
+        重新处理尾部 assistant 消息中“尚未回答”的工具调用（提示回调会找到已经解决的
+        Inbox 项并直接返回；已回答调用会跳过，因此不会重复执行），随后运行模型循环完成该轮。
+
+        Continue a turn that was suspended at a prompt and persisted — durable resume after a
         restart (or engine eviction). Re-process the trailing assistant message's UNANSWERED
         tool-calls (the prompt callbacks find the already-resolved Inbox item and return without
         re-prompting; answered calls are skipped, so nothing double-executes), then run the model
@@ -568,7 +636,13 @@ class TurnEngine:
                 yield event
 
     def _repair_dangling_tool_calls(self) -> None:
-        """Close every orphaned tool_use in history with a stub tool result.
+        """用存根工具结果关闭历史中每个孤儿 tool_use。
+
+        被中断的轮次（审批中重启、调用与结果之间崩溃）会留下带 tool_calls 但没有结果的
+        assistant 消息，Provider 会因此拒绝整段对话。存根会立即插入到出问题的 assistant
+        消息后面，保留 id，并如实说明发生了什么；模型可以在需要时重新发起调用。
+
+        Close every orphaned tool_use in history with a stub tool result.
 
         An interrupted turn (restart mid-approval, crash between call and
         result) leaves an assistant message whose tool_calls have no results;
@@ -604,7 +678,10 @@ class TurnEngine:
             i += 1 + len(stubs)
 
     def _unanswered_trailing_tool_calls(self) -> list[ToolCall]:
-        """The tool-calls of the last assistant message that don't yet have a tool result —
+        """最后一条 assistant 消息中尚无工具结果的 tool-calls，也就是我们挂起时所在的提示
+        （以及其后的任何调用）。从持久化线程中重建。
+
+        The tool-calls of the last assistant message that don't yet have a tool result —
         i.e. the prompt we suspended on (+ any after it). Reconstructed from the persisted thread.
         """
         answered = {
@@ -642,6 +719,9 @@ class TurnEngine:
                 return
             iterations += 1
 
+            # 自动压缩检查点 (OPE-27)：位于工具轮次之间，以及新轮次第一次模型调用之前。
+            # 刻意不向模型发送“收尾”警告。COMPACTING 信号先于可能耗时数秒的摘要器调用发出，
+            # 这样界面能展示进度，而不是静默卡住。
             # Auto-compaction checkpoint (OPE-27): between tool turns and before a new
             # turn's first call. Deliberately no "wrap up" warning to the model. The
             # COMPACTING signal precedes the (multi-second) summarizer call so surfaces
@@ -660,6 +740,8 @@ class TurnEngine:
             streamed_reasoning: list[str] = []
 
             def _partial_turn() -> AssistantTurn:
+                # 用户已经看到的部分：文本与思考，不包含工具调用（任何半成形调用要么成为孤儿，
+                # 要么会违背停止动作继续执行）。
                 # What the user watched arrive — text and thinking, NO tool calls (any
                 # half-formed calls would either orphan or execute against the stop).
                 return AssistantTurn(
@@ -683,6 +765,9 @@ class TurnEngine:
                     if chunk.turn is not None:
                         turn = chunk.turn
             except Exception as exc:  # provider failure
+                # 原始 context-overflow 400（例如估算路径导致压缩预测错误）会进入压缩策略，
+                # 而不是直接暴露给用户。重试带有进度保护：每次都会推进边界或放弃，因此持续
+                # 溢出的模型最终仍会走到错误路径。
                 # A raw context-overflow 400 (compaction mispredicted, e.g. the estimate
                 # path) routes into the compaction policy instead of surfacing. The retry
                 # is progress-guarded: each pass moves the boundary forward or gives up,
@@ -697,6 +782,7 @@ class TurnEngine:
                             EventType.COMPACTED, {"text": notice, "compaction": record}
                         )
                         continue
+                # 与下方停止路径保持同一契约：用户已经看到的部分会在失败后保留下来。
                 # Same contract as the stop path below: the partial the user watched
                 # arrive survives the failure.
                 if streamed or streamed_reasoning:
@@ -712,6 +798,7 @@ class TurnEngine:
                 yield Event(EventType.ERROR, payload)
                 return
             if self._cancel.is_set() and turn is None:
+                # 流式输出中途停止：精确保留用户已经看到的内容。
                 # Stopped mid-stream: persist exactly what the user watched arrive.
                 if streamed or streamed_reasoning:
                     self.messages.append(_assistant_message(_partial_turn()))
@@ -721,6 +808,8 @@ class TurnEngine:
             if turn is None:
                 turn = AssistantTurn()
             if turn.usage is not None:
+                # 触发信号：本次往返实际占用上下文窗口的 prompt 侧总量（若 Provider 从未报告，
+                # 则退回估算）。
                 # The trigger signal: the prompt-side total that actually occupied the
                 # window on this round-trip (estimate fallback when never reported).
                 self._last_context_tokens = turn.usage.context_tokens
@@ -764,6 +853,9 @@ class TurnEngine:
                     self._inject_steering()
                     continue
                 if self._turn_truncated:
+                    # OPE-171：达到输出上限而没有任何可执行内容。刚持久化的回复会标记为
+                    # stub replay（见 `_outbound_messages`）；随后要求模型采取行动并再次循环，
+                    # 除非这种情况已经发生太多次。
                     # OPE-171: cut off at the output limit with nothing actionable. The
                     # reply just persisted is marked for stub replay (see
                     # `_outbound_messages`); the model is asked to act, and the turn
@@ -821,6 +913,10 @@ class TurnEngine:
                         },
                     )
                     return
+                # 模型试图调用工具，但语法始终没能解析；补救逻辑已经尝试过。若此处以
+                # "completed" 结束，就会把半截工具调用当成回答展示，和模型真的决定结束
+                # 无法区分；用户只会看到叙述拖进零散标签。这里改为显式失败，走错误路径，
+                # 让 GUI 提供 Retry。这通常是模型漂移而非确定性故障，重试同一模型往往可行。
                 # The model tried to call a tool and the syntax never parsed — salvage already
                 # had its go. Ending as "completed" here would present a half-written call as
                 # the answer, which is indistinguishable from the model deciding it was done;
@@ -870,6 +966,9 @@ class TurnEngine:
 
             cfg["context_window"] = model_context_windows().get(self.model)
             if not cfg["context_window"] and not self._warned_context_fallback:
+                # OPE-170：未列入矩阵的模型会按 128k 猜测值压缩。对 1M 上下文窗口模型来说，
+                # 这意味着窗口才用到十分之一就压缩，并且每次重建 prompt cache。
+                # 每个 engine 只警告一次。
                 # OPE-170: an unlisted model compacts on the 128k guess, which for a
                 # 1M-window model means compacting at a tenth of the window and
                 # rebuilding the prompt cache each time. Say so once per engine.
@@ -888,7 +987,10 @@ class TurnEngine:
         return cfg
 
     def _compaction_due(self) -> bool:
-        """The trigger check alone — cheap and side-effect free, so the loop can emit
+        """仅执行触发检查；它成本低且无副作用，因此主循环能在提交给较慢的摘要器调用前
+        先发出 COMPACTING 信号。
+
+        The trigger check alone — cheap and side-effect free, so the loop can emit
         the COMPACTING signal before committing to the (slow) summarizer call."""
         cfg = self._compaction_config()
         if cfg.get("enabled") is False:
@@ -904,7 +1006,12 @@ class TurnEngine:
         )
 
     def _compaction_record(self) -> Optional[dict[str, Any]]:
-        """The compaction that just happened, as persisted on the `compacted` notice and
+        """刚发生的压缩记录，会持久化在 `compacted` notice 上并携带在 COMPACTED 事件中
+        （OPE-170 problem 2）：包括摘要文本、工作状态、规范转录边界、摘要模型，以及是否
+        是无摘要裁剪。没有它时，已保存会话只能看出“发生过压缩”，但不知道保留了什么；
+        app 的 session record 只保留最新状态，导出的轨迹/运行记录则完全没有。
+
+        The compaction that just happened, as persisted on the `compacted` notice and
         carried on the COMPACTED event (OPE-170 problem 2): summary text, working state,
         the boundary into the canonical transcript, the summarizer model, and whether it
         was the no-summary trim. Without it a saved session only showed THAT compaction
@@ -914,7 +1021,12 @@ class TurnEngine:
         return state.as_dict() if state is not None else None
 
     async def _compact_now(self, *, force: bool = False) -> Optional[str]:
-        """Run the compaction policy. Callers gate on `_compaction_due()` (or `force`,
+        """运行压缩策略。调用方以 `_compaction_due()`（或溢出路径的 `force`）作为门禁。
+        当 outbound 视图发生变化时返回用户可见 notice 文本，否则返回 None。失败策略按规范：
+        两种模式都先重试一次；有人值守则提示 Retry / Trim；无人值守则自动裁剪并继续
+        （绝不让运行停在内部账务上）。
+
+        Run the compaction policy. Callers gate on `_compaction_due()` (or `force`,
         the overflow path). Returns the user-facing notice text when the outbound view
         changed, else None. Failure policy per spec: retry once (both modes); attended →
         Retry / Trim prompt; unattended → auto-trim and continue (never park a run on
@@ -925,6 +1037,8 @@ class TurnEngine:
         window = cfg.get("context_window")
         trigger = _compaction.trigger_tokens(window, threshold_pct=pct, cap_tokens=cap)
         keep = int(_compaction.KEEP_RECENT_FRACTION * trigger)
+        # OPE-189：两个预算都随触发阈值缩放，因此为了省 token 而降低阈值时，不会被
+        # 一个继续花掉释放空间的块抵消掉。
         # OPE-189: both budgets scale with the trigger, so lowering it to save tokens can't
         # be undone by a block that keeps spending the freed space.
         user_budget = _compaction.user_message_budget(trigger)
@@ -979,6 +1093,8 @@ class TurnEngine:
                 except Exception:
                     continue
         if state is not None:
+            # OPE-186 变更 3：保持被压缩轮次可读。边界之前的逐字转录写入溢出工具结果旁边的文件，
+            # 压缩块告诉模型文件在哪里，因此摘要遗漏的细节只需一次读取，而不是彻底丢失。
             # OPE-186 change 3: keep the compacted turns readable. The verbatim transcript
             # up to the boundary goes to a file next to the spilled tool results, and the
             # compacted block tells the model where it is, so a detail the summary dropped
@@ -1015,7 +1131,10 @@ class TurnEngine:
 
     # -- helpers ----------------------------------------------------------------
     async def _astream(self):
-        """Bridge the provider's blocking stream generator to the async loop via a
+        """通过线程 + 队列把 Provider 的阻塞式 stream 生成器桥接到异步循环，
+        让文本 delta 可以实时浮出，同时不阻塞事件循环。
+
+        Bridge the provider's blocking stream generator to the async loop via a
         thread + queue, so text deltas surface live without blocking the event loop."""
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue()
@@ -1032,6 +1151,8 @@ class TurnEngine:
                 for chunk in provider.stream(
                     model=model, messages=messages, tools=tools, **settings
                 ):
+                    # 用户按下 Stop：在 chunk 间丢弃流（从线程读取 asyncio.Event 标志是安全的；
+                    # 我们只读不写）。
                     # User pressed Stop: drop the stream between chunks (reading the
                     # asyncio.Event's flag from a thread is safe; we only read).
                     if self._cancel.is_set():
@@ -1044,6 +1165,8 @@ class TurnEngine:
 
         loop.run_in_executor(None, produce)
         while True:
+            # 让队列读取与 Stop 竞争，避免停滞的流（没有 chunk 到达：首 token 前等待、
+            # 卡住的连接）拖住整个轮次。
             # Race the queue against Stop so a stalled stream (no chunks arriving —
             # the pre-first-token wait, a wedged connection) can't hold the turn.
             get_task = asyncio.ensure_future(queue.get())
@@ -1180,7 +1303,15 @@ class TurnEngine:
             yield self._record_result(tool_call, result, status)
 
     def _mangled_tool(self, tool_call: ToolCall) -> Event:
-        """Answer a tool call whose arguments never parsed, with the real diagnosis.
+        """用真实诊断回答一个参数从未成功解析的工具调用。
+
+        两类原因对应两种修复方式；只有错误信息说明发生了哪一种，模型才能选对方案。
+        截断（`finish_reason == "length"`）意味着“同样内容，拆小块”；普通坏 JSON 则意味着
+        “按声明参数重新发送”。无论哪种，都不把原始文本回放进历史：存下的 `{"_raw": ...}`
+        调用会像成功示例一样教模型故意输出 `_raw`（2026-08-15 观察到），还会让垃圾 token
+        每轮重复发送。
+
+        Answer a tool call whose arguments never parsed, with the real diagnosis.
 
         Two causes, two different cures — and the model can only pick the right one if
         the error says which happened. Truncation (`finish_reason == "length"`) means
@@ -1211,7 +1342,11 @@ class TurnEngine:
         )
 
     def _interrupted_tool(self, tool_call: ToolCall) -> Event:
-        """The stop-path answer for a call that will not run: a tool-error result in the
+        """停止路径里给“不再运行”的调用的答复：在历史中写入一个工具错误结果
+        （托管聊天模板会拒绝孤儿 tool_calls，持久化恢复也会重新提示它），并为工具卡片
+        发出完成事件。
+
+        The stop-path answer for a call that will not run: a tool-error result in the
         history (hosted chat templates reject orphaned tool_calls, and durable-resume
         would otherwise re-prompt it) + the finished event for the tool card."""
         self.messages.append(_tool_error_message(tool_call, "interrupted by user"))
@@ -1300,6 +1435,8 @@ class TurnEngine:
                 for a, r, q in self._ask_replies
                 if a == i
             )
+        # 当前轮次捕获的回复（anchor == len(texts)），或锚点消息本身为空/被跳过之后的回复，
+        # 放到尾部；这样同一轮刚给出的同意会立刻对审查器评估下一步动作可见。
         # Replies captured during the current turn (anchor == len(texts)) — or after an
         # anchor message that was itself empty/skipped — land at the tail, so a same-turn
         # consent is already visible to the reviewer for the very next action.
@@ -1404,7 +1541,9 @@ class TurnEngine:
             self._reviewer_input_snapshots[tc.id] = (request, history, context)
 
     async def _consult_reviewer(self, tool_call: ToolCall) -> Any:
-        """The parked verdict from `_preconsult_reviewer`, or a fresh single call."""
+        """返回 `_preconsult_reviewer` 暂存的裁决；没有暂存时现场发起一次单独审查。
+
+        The parked verdict from `_preconsult_reviewer`, or a fresh single call."""
         verdict = self._reviewer_verdicts.pop(tool_call.id, None)
         snapshot = self._reviewer_input_snapshots.pop(tool_call.id, None)
         if verdict is not None:
@@ -1512,6 +1651,8 @@ class TurnEngine:
         if self.reviewer is None or not self.reviewer_shadow:
             return
         if tool_call.name == "decide_worker_call":
+            # 只能审查当前已经解析出的动作。这个代理使用按需实时路径；绝不只把 ID
+            # 发给影子裁决器。
             # Only the current, resolved action can be reviewed. This proxy uses
             # the on-demand live path; never send just its ID to the shadow judge.
             return
@@ -1575,6 +1716,11 @@ class TurnEngine:
         allowed = decision.allowed
         reason = decision.reason
 
+        # OPE-114 §1：运行智能体本会话下载的东西，是经典“先获取再执行”链条；
+        # 它不存在静默合法形态。因此它会交给人处理，越过审查器和任何原本可能放行的命令白名单
+        # （`python` 前缀规则不能为刚从互联网拉下来的脚本背书）。硬拒绝保持不变：
+        # 这一底线只会收紧允许，绝不放松阻断。智能体自己写的文件不触发底线——
+        # “写这个脚本并运行”是普通工作——但会作为事实交给审查器权衡。
         # OPE-114 §1: running something the agent DOWNLOADED this session is the classic
         # fetch-then-execute chain, and there is no quiet legitimate version of it — so it
         # goes to a person, over both the reviewer and any command allowlist that would
@@ -1598,6 +1744,8 @@ class TurnEngine:
             )
 
         if allowed and decision.rule:
+            # 任务范围的长期规则自动放行了该调用：审计具体规则（§25 不变量：每个自动放行调用
+            # 都引用其规则），并记住它，以便工具卡片能显示“由长期规则允许”。
             # A task-scoped standing rule auto-allowed this call: audit the exact rule
             # (§25 invariant — every auto-allowed call cites its rule) and remember it so
             # the tool card can say "allowed by standing rule".
@@ -1606,11 +1754,18 @@ class TurnEngine:
                 tool_call, stage="auto_allowed", status="allowed", reason=reason
             )
 
+        # (c) Bypass 模式运行了一个没有其他规则允许的有后果调用：标注来源。
+        # "full access" 是 permissions.py bypass 分支的精确 reason 字符串。
         # (c) Bypass mode ran a consequential call no other rule allowed: annotate it.
         # "full access" is the exact reason string of permissions.py's bypass branch.
         if allowed and decision.reason == "full access":
             self._approval_origins[tool_call.id] = {"origin": "bypass"}
 
+        # OPE-136：trusted-MCP 允许基于长期配置无卡运行（用户 trust 规则，或旧 server 标志）；
+        # 像其他无卡来源一样审计并显示标签（“有记录，绝不隐形”）。这里前缀匹配
+        # permissions.py 的两种 trusted 分支 reason 字符串，并在标签中区分二者：
+        # “your trust rule” 指向工具页 Revoke，“server trust” 指向 mcp.json 标志。
+        # 曾经一个泛化标签让用户误以为 SERVER 标记了他们自己的规则（owner-hit 2026-08-30）。
         # OPE-136: a trusted-MCP allow ran cardless on standing config (a user trust
         # rule, or the legacy server flag) — audited and chip-annotated like every
         # other cardless origin ("recorded, never invisible"). Prefix-matched against
@@ -1629,6 +1784,8 @@ class TurnEngine:
                 tool_call, stage="auto_allowed", status="allowed", reason=reason
             )
 
+        # OPE-136 运行内授权：被覆盖的调用因用户在本次运行中点击“Allow for this request”
+        # 而无卡运行——不打扰注意力，但记录上绝不隐形（转录标签 + 审计行，与所有无卡来源一致）。
         # OPE-136 run grant: a covered call ran cardless under the user's in-run
         # "Allow for this request" click — silent to attention, never invisible to
         # the record (transcript chip + audit row, like every cardless origin).
@@ -1639,12 +1796,18 @@ class TurnEngine:
             )
 
         if not allowed and decision.needs_user and self._consume_allow_anyway(tool_call):
+            # §8.4 "Allow anyway"：人已经从拒绝卡片批准了这个精确动作。一次性——上面已消耗；
+            # 不同动作绝不会匹配。
             # §8.4 "Allow anyway": the human already approved this exact action from the
             # deny card. One-shot — consumed above; a different action never matches.
             allowed = True
             reason = "approved by user (allow anyway)"
             self._audit(tool_call, stage="auto_allowed", status="allowed", reason=reason)
 
+        # 组长 DENY 某个工作节点等待中的调用不会运行任何东西：工作节点被告知“不行”并继续，
+        # 人仍可直接回复该工作节点。在 Auto-Approve 下，这既不需要审查器也不需要卡片
+        # （live 2026-09-17：用户曾被要求“Allow”一个拒绝）。ALLOW 仍会进入下方审查器，
+        # Manual 组长仍会两种都询问——该模式意味着“全部展示给我”。
         # A lead DENYING one of its workers' waiting calls runs nothing: the worker is told
         # no and moves on, and the human can still answer the worker directly. Under
         # Auto-Approve that needs neither the reviewer nor a card (live 2026-09-17: the
@@ -1748,6 +1911,8 @@ class TurnEngine:
                 {"kind": "reviewer_unsure", "reason": unsure_note} if unsure_note else
                 {"kind": "reviewer_unavailable", "reason": ""} if self.permissions.mode is Mode.AUTO_APPROVE else None
             )
+            # 影子评估：记录审查器会如何评价这张卡片。若实时路径已经咨询过审查器，则跳过
+            # （`unsure` 落到卡片时已经以 reviewer_verdict 审计，避免重复花费）。
             # Shadow evaluation: record what the reviewer would have said about this card.
             # Skipped when the live path already consulted it (an `unsure` falling through
             # to the card is already audited as reviewer_verdict — no double spend).
@@ -1760,6 +1925,8 @@ class TurnEngine:
                     "arguments": tool_call.arguments,
                     "reason": decision.reason,
                     "escalation": escalation,
+                    # `unsure` 裁决触发了这张卡片：审查器的一句话理由就地回答
+                    # “为什么要问我？”（owner ask 2026-08-24）。
                     # An `unsure` verdict raised this card: the reviewer's one-line reason
                     # answers "why am I being asked?" in place (owner ask 2026-08-24).
                     **(
@@ -1768,6 +1935,9 @@ class TurnEngine:
                         else {}
                     ),
                     "category": getattr(metadata, "category", ""),
+                    # 长期规则可以固定的精确目标；若调用不符合条件（无声明 target 参数 / exec 风险），
+                    # 则为 None。界面仅在自动化运行的审批卡上据此提供“Allow every time”。
+                    # OPE-114 §1：这是审查器和人都无法仅从命令文本中获知的事实。
                     # The exact target a standing rule could pin, or None when the call
                     # isn't eligible (no declared target arg / exec risk). Surfaces use it
                     # to offer "Allow every time" on automation-run approval cards only.
@@ -1780,9 +1950,14 @@ class TurnEngine:
                         metadata,
                         self.permissions.risk_overrides,
                     ),
+                    # 当该 shell 命令被分类为只读时为 True；卡片只有这时才提供
+                    # “Allow read-only commands for this session”。
                     # True when this shell command classifies as read-only — the card
                     # offers "Allow read-only commands for this session" only then.
                     "readonly_ok": _readonly_ok(tool_call.arguments),
+                    # OPE-136 finding 4：MCP 调用实际发往何处，由注册时 (mcp/tools.py)
+                    # 根据 server def 盖章；这样卡片范围标签能说“leaves this computer -> host”，
+                    # 而不是笼统的“stays on this computer”。非 MCP 工具为 None。
                     # OPE-136 finding 4: where an MCP call actually goes, stamped at
                     # registration (mcp/tools.py) from the server def — so the card's
                     # scope chip can say "leaves this computer → host" instead of the
@@ -1877,10 +2052,13 @@ class TurnEngine:
                 elif outcome is ApprovalOutcome.READONLY_SESSION:
                     self.permissions.allow_readonly_for_session()
                 elif outcome is ApprovalOutcome.ALWAYS_TRUST:
+                    # 持久化的逐工具信任 (OPE-136 §4)：落入用户本地 override store，
+                    # 因此明天的会话也保持安静。
                     # Durable per-tool trust (OPE-136 §4): lands in the user-local
                     # override store, so tomorrow's sessions stay quiet too.
                     self.permissions.grant_trust_for_tool(tool_call.name)
                 elif outcome is ApprovalOutcome.THIS_RUN:
+                    # 运行内授权：随当前回答结束而失效（在 run() 中清除）。
                     # Run grant: dies with the current answer (cleared in run()).
                     self.permissions.allow_tool_for_run(tool_call.name)
                 allowed, reason = True, "approved by user"
@@ -1939,7 +2117,9 @@ class TurnEngine:
         yield True
 
     def _execute_sync(self, tool_call: ToolCall) -> tuple[Any, str]:
-        """Execute one authorized call (runs in a worker thread)."""
+        """执行一个已授权调用（在工作线程中运行）。
+
+        Execute one authorized call (runs in a worker thread)."""
         started, clock = time.time(), time.monotonic()
         try:
             delegated = self._authorized_delegates.pop(tool_call.id, None)
@@ -1960,10 +2140,14 @@ class TurnEngine:
             self._yield_for_wake = True
         self._step += 1
         if status == "ok":
+            # 只记录成功调用：抛错的写入没有在磁盘上留下可运行目标。
             # Only successful calls: a write that raised left nothing on disk to run.
             self._agent_files.record(
                 tool_call.name, tool_call.arguments, result, step=self._step
             )
+        # 工具结果里的 `_display` 键是用户可见元数据，智能体绝不能看到（例如 Gmail 隐私过滤器
+        # 隐藏了多少命中——模型可能围绕该计数探测）。将它提升为消息 sidecar（类似 `source`），
+        # 在 `_outbound_messages` 的每个 Provider 输入中剥离，但为 GUI 工具卡片持久化。
         # A `_display` key on a tool result is user-facing metadata the AGENT must
         # never see (e.g. how many gmail hits the privacy filters hid — a count
         # the model could probe around). Lift it onto the message as a sidecar
@@ -1975,6 +2159,8 @@ class TurnEngine:
             result = {k: v for k, v in result.items() if k != "_display"}
         origin = self._approval_origins.pop(tool_call.id, None)
         if origin:
+            # 来源信息通过与隐私计数相同的仅展示 sidecar 跨重载保留（owner ruling 2026-08-24）；
+            # `_outbound_messages` 会剥离它，因此任何 Provider 都看不到。
             # Provenance survives reload via the same display-only sidecar as the privacy
             # counts (owner ruling 2026-08-24) — `_outbound_messages` strips it, so no
             # provider ever sees it.
@@ -1984,6 +2170,8 @@ class TurnEngine:
                 **({"approval_note": origin["note"]} if origin.get("note") else {}),
                 **({"approval_grant": origin["grant"]} if origin.get("grant") else {}),
             }
+        # OPE-186 变更 1：模型看到的内容（且后续每轮都会重读的内容）在这里对每个工具只裁剪一次。
+        # 上面的 provenance 已记录完整结果。
         # OPE-186 change 1: what the model sees (and re-reads on every later turn) is
         # bounded here, once, for every tool. Provenance above recorded the full result.
         result = toolresult.bound_tool_result(
@@ -2000,6 +2188,7 @@ class TurnEngine:
         hidden = int((display or {}).get("hidden_by_filters") or 0)
         stripped = int((display or {}).get("hidden_fields") or 0)
         if hidden or stripped:
+            # 用户能看到的带外痕迹：规则类别 + 数量，绝不包含内容。
             # The out-of-band trace the user CAN see: rule class + count, never content.
             parts = []
             if hidden:
@@ -2030,6 +2219,7 @@ class TurnEngine:
                 "result_preview": _preview(result),
                 **({"display": display} if display else {}),
                 **({"standing_rule": rule} if rule else {}),
+                # (c) 静默来源标签，与 `_display` sidecar 持久化的字段相同。
                 # (c) quiet provenance chip — same fields the `_display` sidecar persists.
                 **(
                     {
@@ -2044,7 +2234,15 @@ class TurnEngine:
         )
 
     def _note_ingestion(self, tool_call: ToolCall, status: str) -> None:
-        """Record that outside content entered this session, and from where. The fact and
+        """记录外部内容进入了本会话以及来源。只记录事实和来源，绝不记录内容，哪怕是截断内容。
+
+        **v1 中没有任何东西消费它。** 它的存在是为了将来把该事实提供给审查器时
+        （v2, `PRV-1`），可以通过回放影子运行回答“这是否会改变裁决？”，而不是重新争论。
+        见 `session_facts.py` 与规范 Part 0。
+
+        失败调用会跳过：失败的 fetch 没有带入任何内容。
+
+        Record that outside content entered this session, and from where. The fact and
         the source only — never the content, not even truncated.
 
         **Nothing consumes this in v1.** It exists so that when the reviewer is eventually
@@ -2063,7 +2261,11 @@ class TurnEngine:
         self._audit(tool_call, **record.to_audit())
 
     def _audit_usage(self, usage: Any) -> None:
-        """One content-blind audit row per model round-trip (spec §5: the per-turn usage
+        """每次模型往返写一行不含内容的审计记录（规范 §5：逐轮 usage 事件），
+        使导出的 token 列真实可信；工具行过去只携带审查器自己的 token。
+        stage 为 "usage"，模型放在（已清洗的）args 中。
+
+        One content-blind audit row per model round-trip (spec §5: the per-turn usage
         event), so exported token columns are honest — tool rows only ever carried the
         reviewer's own tokens. Stage "usage", the model in the (sanitized) args."""
         if self.audit_sink is None:
@@ -2283,6 +2485,9 @@ class TurnEngine:
         args = tool_call.arguments or {}
         plan = str(args.get("plan", ""))
         if self.permissions.mode is not Mode.PLAN:
+            # 该工具始终注册（模式可在会话中途切换），但只有会话确实处于 plan 模式时，
+            # 提交计划才有意义。下一步因模式而异：discuss 保持只读，因此智能体应在聊天中
+            # 讲清变更；可写模式则应直接执行。
             # The tool is always registered (mode can flip mid-session), but proposing a
             # plan only means something while the session is actually in plan mode. The
             # right next step differs by mode: discuss stays read-only, so the agent
@@ -2312,6 +2517,8 @@ class TurnEngine:
             }
 
         if result.get("approved"):
+            # 审批器可以选择计划后的模式（"interactive" 每次写入都询问，"auto" 则按已批准计划
+            # 执行而不再提示）。
             # The approver may pick the post-plan mode ("interactive" asks per write,
             # "auto" executes the approved plan without further prompts).
             try:
@@ -2366,6 +2573,9 @@ class TurnEngine:
                 ),
             }
         elif _toolchain.describe(name) is None:
+            # 不在固定目录中：完全不展示卡片（owner-hit 2026-08-20：智能体曾把普通
+            # brew/pip 安装路由到安装卡片，批准后也只会失败）。智能体有 shell 及其自身审批流；
+            # 引导它走那里，而不是把问题抛给用户。
             # Not in the pinned catalog: no card at all (owner-hit 2026-08-20 — agents
             # routed ordinary brew/pip installs through the install card, which could
             # only fail after approval). The agent has a shell with its own approval
@@ -2383,6 +2593,8 @@ class TurnEngine:
                 ),
             }
         else:
+            # 提示必须预先说明“我们”是否能安装它（该平台的固定构建）。如果对一个无法获取的工具
+            # 提供 Install 卡片，就会把用户批准变成必然错误。没有元数据即视为不能安装。
             # The prompt must say up front whether WE can install this (pinned build for
             # this platform) — a card that offers Install for a tool we can't fetch turns
             # the user's approval into a guaranteed error. Absence of metadata means NO.
@@ -2404,6 +2616,9 @@ class TurnEngine:
                 interrupted={"installed": False, "error": "interrupted by user"},
             ) or {"installed": False, "error": "no response"}
             if not result.get("installed"):
+                # 卡片写着“也可以自行安装后继续”——要兑现这个承诺。用户在提示期间通过 brew 等
+                # 安装工具并点击 Continue，意味着他们已经提供了该工具，而不是拒绝；在视为拒绝前
+                # 先寻找用户自己的副本。
                 # The card says "or install it yourself and continue" — honor it. A user
                 # who brewed the tool mid-prompt and clicked Continue has PROVIDED it,
                 # not declined it; find their copy before treating this as a refusal.
@@ -2504,6 +2719,8 @@ class TurnEngine:
         from the Inbox when unattended), and return it as the tool result."""
         args = tool_call.arguments or {}
         question = str(args.get("question", "")).strip()
+        # 分组形式 (OPE-51)：只有 `questions` 也是合法调用；单数 `question` 字段可以为空。
+        # asker 会规范化/校验条目；这里仅判断“是否问了任何问题？”。
         # Grouped form (OPE-51): `questions` alone is a valid call — the singular field may be
         # empty. The asker normalizes/validates the entries; here only "is anything asked?".
         if not question:
@@ -2521,6 +2738,8 @@ class TurnEngine:
                 ),
             }
         else:
+            # asker 感知模式（有人值守 -> 实时内联提示；无人值守 -> Inbox），因此由它负责展示问题。
+            # 引擎只等待答案。
             # The asker is mode-aware (attended → live inline prompt; unattended → Inbox), so it
             # owns surfacing the question. The engine just awaits the answer.
             self._audit(tool_call, stage="question_requested", reason=question)
@@ -2614,6 +2833,11 @@ class TurnEngine:
         last user message. Never mutates `self.messages`, so neither the strip nor the block is
         persisted/replayed.
         """
+        # 剥离仅展示用的 sidecar：`source`（连接器卡片）、`_display`（例如过滤隐藏计数）、
+        # `ts`（追加时间戳）、`reasoning`（思考文本）、`usage`（token 计数）、
+        # `finish_reason`（回复结束方式）和 `max_output_tokens`（发送的上限）。
+        # 只复制携带这些字段的消息。整条 `notice` 消息（error/interrupted/model-switch 标记）
+        # 也是仅展示用：完全丢弃。
         # Strip the display-only sidecars — `source` (connector cards), `_display`
         # (e.g. filter-hidden counts), `ts` (append-time timestamps), `reasoning`
         # (thinking text), `usage` (token counts), `finish_reason` (how the reply ended)
@@ -2634,12 +2858,16 @@ class TurnEngine:
             "served_by",
             "replay",
         )
+        # 自动压缩 (OPE-27)：边界前的一切都由 compacted block 表示。仅 outbound 生效——
+        # 规范历史保持完整——并且 block+tail 在轮次之间字节稳定，因此 prompt caching 继续有效。
         # Auto-compaction (OPE-27): everything before the boundary is represented by the
         # compacted block. Outbound-only — the canonical history stays intact — and the
         # block+tail are byte-stable between turns, so prompt caching keeps working.
         source_messages = _compaction.apply_to_outbound(
             self.messages, self.compaction_state
         )
+        # 运行时回执不进入 Provider 载荷。提醒/看板上下文是较早的智能体上下文，
+        # 不是归因于新进入用户的话，也绝不是 system 指令。真实用户消息保持逐字且保持最后。
         # Runtime receipts stay out of provider payloads. Reminder/board context is
         # earlier agent context, not words attributed to the incoming user and never
         # a system instruction. Keep the actual user message verbatim and last.
@@ -2652,6 +2880,7 @@ class TurnEngine:
         source_messages = expanded
         out = [
             (
+                # OPE-171：长度截断且没有动作的回复，在重放时用存根代替。
                 # OPE-171: a length-truncated, action-free reply is replayed as a stub.
                 {"role": "assistant", "content": TRUNCATION_STUB}
                 if msg.get("replay") == "stub"
@@ -2662,6 +2891,9 @@ class TurnEngine:
             for msg in source_messages
             if msg.get("role") != "notice"
         ]
+        # PDF 附件（存为 `file` parts）就在这里适配当前 ACTIVE 模型——绝不写回持久历史。
+        # 因此会话中途切换模型时总会重新决策：原生 PDF 模型拿到真实文档，其余模型拿到
+        # 本地文本抽取/页面图片降级结果 (pdf_support.py)。
         # PDF attachments (stored as `file` parts) are adapted to the ACTIVE model right
         # here — never in the persisted history — so a mid-session model switch always
         # re-decides: native PDF models get the real document, the rest get the local
@@ -2688,6 +2920,8 @@ class TurnEngine:
                     for msg in out
                 ]
 
+        # 图片使用同样的逐轮处理：无视觉能力的模型会收到可见占位符，而不是它会拒绝的载荷。
+        # 和 PDF 路径一样，每次调用都重新决策，因此会话中途切入/切出视觉模型总能得到正确处理。
         # Images get the same per-turn treatment: a model without vision receives a visible
         # placeholder instead of a payload it would reject. Like the PDF path, this re-decides
         # per call, so a mid-session switch to/from a vision model always does the right thing.
@@ -2728,6 +2962,14 @@ class TurnEngine:
         ) or ""
         if not context:
             return out
+        # 该块挂在最后一条用户消息上——对所有 Provider 保持同一形状。在普通聊天中它就是最新消息；
+        # 在工具循环中（工具结果 role 为 "tool"），它是任务提示，也就是第一条用户消息。
+        # 这只有在该块不包含会自行变化的内容时才安全。OPE-192：过去它以精确到分钟的 `Now:`
+        # 开头，因此每跨一分钟就重写第一条消息；而 Provider 的 prompt cache 只能复用到第一处
+        # 不同字节之前，导致整段对话被重新处理（实测：一次 Fable 5.1 尝试中 105 次调用的 16 次
+        # 承担了 95% cache writes；Kimi K3 运行中跨分钟命中失败率为 60%，否则为 1.5%）。
+        # 现在时间是工具 (`current_time`)。剩下的内容——文件夹、技能菜单、模式提示——只在用户改变
+        # 某些东西时才变，因此 outbound 历史在轮次之间保持字节一致。临时块：绝不持久化。
         # The block rides on the LAST user message — one shape for every provider. In a
         # chat that is the newest message; in a tool loop (tool results carry role "tool")
         # it is the task prompt, message one. That is only safe because the block holds
@@ -2761,7 +3003,10 @@ class TurnEngine:
 
 
 def _effort_record(turn: AssistantTurn, setting: Optional[str]) -> Optional[dict[str, Any]]:
-    """What the run record says about reasoning effort for this reply (OPE-176): the
+    """为本次回复写入运行记录的 reasoning effort 信息 (OPE-176)：优先使用 Provider
+    自己报告的映射；否则如果配置了某个档位，则明确记录“已请求但未报告”，避免设置静默丢失。
+
+    What the run record says about reasoning effort for this reply (OPE-176): the
     provider's own mapping when it reported one; otherwise, when a level was configured,
     an explicit "requested but not reported" so the setting is never silently lost."""
     if turn.effort:
@@ -2784,11 +3029,19 @@ def _assistant_message(
         "ts": time.time(),
     }
     if turn.usage is not None:
+        # 展示/聚合用 sidecar（类似 `reasoning`）：随消息持久化，Provider 调用前剥离。
+        # 标记产生它的模型，使按模型汇总在会话中途切换模型后仍准确。
         # Display/aggregation sidecar (like `reasoning`): persisted with the message,
         # stripped before provider calls. Tagged with the model that produced it so
         # per-model rollups survive mid-session model switches.
         message["usage"] = {"model": model, **turn.usage.as_dict()}
     if turn.finish_reason:
+        # 回复如何结束，使用引擎规范化词汇（`stop` / `tool_calls` / `length`；
+        # 未知 Provider 值原样透传）。持久化后，已保存会话无需从 token 计数重新推导，
+        # 就能区分“选择停止”和“触及输出上限”(OPE-173)。部分轮次及未报告 stop reason
+        # 的 Provider 会省略该字段——绝不写 null。每次 Provider 调用前剥离
+        # (`_outbound_messages`)。若 Provider 原始值不同，则保存在该 Provider 的 sidecar
+        # 中（例如 `_anthropic.stop_reason`）。
         # How the reply ended, in the engine's normalised vocabulary (`stop` /
         # `tool_calls` / `length`; unknown provider values pass through). Persisted
         # so a saved session can tell "chose to stop" from "hit the output limit"
@@ -2798,23 +3051,32 @@ def _assistant_message(
         # it differs, lives in that provider's sidecar (e.g. `_anthropic.stop_reason`).
         message["finish_reason"] = turn.finish_reason
     if turn.output_limit:
+        # Provider 实际发送的逐回复输出上限 (OPE-177)，因此 `length` 结束能对应到产生它的限制。
+        # 与 `usage` 一样是展示 sidecar：每次 Provider 调用前剥离。
         # The per-reply output ceiling the provider actually sent (OPE-177), so a
         # `length` finish can be read against the limit that produced it. Display
         # sidecar like `usage`: stripped before every provider call.
         message["max_output_tokens"] = turn.output_limit
     effort_record = _effort_record(turn, effort_setting)
     if effort_record:
+        # 本次回复的 reasoning-effort 映射 (OPE-176)。与 `usage` 一样是展示 sidecar：
+        # 每次 Provider 调用前剥离。
         # The reasoning-effort mapping for this reply (OPE-176). Display sidecar like
         # `usage`: stripped before every provider call.
         message["reasoning_effort"] = effort_record
     if turn.served_by:
+        # 路由器为本次回复报告的上游主机（展示 sidecar）。
         # The upstream host a router reported for this reply (display sidecar).
         message["served_by"] = turn.served_by
     if turn.reasoning:
+        # 仅展示用思考文本——由 GUI 渲染，每次 Provider 调用都会剥离
+        # (`_outbound_messages`)；Provider 私有重放块则通过 `extras` 传递。
         # Display-only thinking text — rendered by the GUI, stripped for every provider
         # (`_outbound_messages`); provider-private replay blocks go via `extras` instead.
         message["reasoning"] = turn.reasoning
     if turn.extras:
+        # Provider 私有 sidecar（例如 `_gemini` thought signatures）随消息持久化；
+        # 所属 Provider 会重新附加它们，其他 Provider 会剥离它们 (base.py)。
         # Provider-private sidecars (e.g. `_gemini` thought signatures) persist with the
         # message; the owning provider reattaches them, the rest strip them (base.py).
         message.update(turn.extras)
@@ -2834,13 +3096,20 @@ _MANGLED_PREVIEW_CHARS = 200
 
 
 def _is_mangled(tool_call: ToolCall) -> bool:
-    """Provider arg-parsers fall back to `{"_raw": <unparsed text>}` when a tool call's
+    """当工具调用参数不是 JSON object 时，Provider 参数解析器会回退到
+    `{"_raw": <未解析文本>}`（通常是流在参数中途被截断）。
+
+    Provider arg-parsers fall back to `{"_raw": <unparsed text>}` when a tool call's
     arguments aren't a JSON object (typically a stream truncated mid-arguments)."""
     return set(tool_call.arguments or {}) == {"_raw"}
 
 
 def _sanitize_mangled_calls(turn: AssistantTurn) -> None:
-    """Shrink each mangled call's stored raw text to a short preview BEFORE the turn
+    """在轮次进入历史前，把每个损坏调用保存的 raw 文本缩成短预览。
+    完整文本是垃圾（半个 JSON 文档）：重放它每轮会花费成千上万 token，更糟的是还会教模型
+    `_raw` 是一种它应当模仿的真实参数形状。
+
+    Shrink each mangled call's stored raw text to a short preview BEFORE the turn
     enters history. The full text is junk (half a JSON document): replaying it costs
     thousands of tokens per turn and, worse, teaches the model that `_raw` is a real
     parameter shape it should imitate."""
